@@ -69,7 +69,7 @@ class MFUCallback:
             )
         except Exception as exc:
             warnings.warn(
-                f"mfu-tracker: calflops profiling failed ({exc}); MFU will not be logged.",
+                f"mfu-tracker: FLOP profiling failed ({exc}); MFU will not be logged.",
                 stacklevel=2,
             )
 

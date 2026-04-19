@@ -81,12 +81,36 @@ def profile_flops(
     modern transformer attention implementations without any manual correction.
     Falls back to ``thop`` on older PyTorch versions.
 
-    Note: SDPA FLOPs are only counted when the model is on CUDA (the kernel
-    dispatches differently on CPU). If you profile a CPU model, attention FLOPs
-    will be missing — move the model to CUDA first for an accurate count.
+    **Quantized models (bitsandbytes INT8 / NF4):**
+    Both counters operate on the Python/ATen graph and cannot see inside opaque
+    bitsandbytes CUDA kernels. In practice the FLOPs reported are close to
+    correct because NF4 (used by QLoRA) dequantizes weights to fp16 before the
+    matmul, so the actual computation is a standard fp16 GEMM. INT8 similarly
+    performs an fp16-equivalent matmul after dequantization in most bitsandbytes
+    kernels. Pass the appropriate ``dtype`` to ``track()`` / ``compute_mfu()``
+    to select the correct peak TFLOPS ceiling::
+
+        # QLoRA (NF4 base + fp16 LoRA adapters) — adapters run in fp16
+        flops = profile_flops(model, kwargs=batch, with_backward=False)
+        with track(flops, param_bytes(model), dtype="fp16", spec=spec) as r:
+            ...
+
+        # Pure INT8 inference
+        with track(flops, param_bytes(model), dtype="int8", spec=spec) as r:
+            ...
+
+    **PEFT / LoRA MBU:**
+    ``param_bytes(model)`` counts all parameters including the frozen base,
+    which is correct for the forward pass (all weights are read from memory).
+    For a backward-pass MBU estimate that excludes frozen weights, use
+    ``param_bytes(model, trainable_only=True)``::
+
+        # Backward MBU for a LoRA-finetuned model
+        active_bytes = param_bytes(model, trainable_only=True)
 
     Args:
-        model:         The nn.Module to profile.
+        model:         The nn.Module to profile. Should be on CUDA for accurate
+                       SDPA counts.
         args:          Positional inputs passed to model(*args).
         kwargs:        Keyword-only inputs (e.g. HF models). Baked into a thin
                        wrapper since both profilers call ``model(*inputs)``.
