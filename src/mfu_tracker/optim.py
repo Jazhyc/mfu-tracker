@@ -22,8 +22,9 @@ class MFUOptimizerWrapper:
     manually. The ratio is derived from the actual wall time split between forward
     and backward each step.
 
-    ``zero_grad()`` is called automatically inside ``track_step()``, so it should
-    be removed from the training loop.
+    ``zero_grad()`` is called automatically at the *start* of ``track_step()``.
+    Call ``optimizer.step()`` **after** the block so it is excluded from the
+    timing window (otherwise optimizer time inflates the apparent backward factor).
 
     Usage::
 
@@ -48,7 +49,7 @@ class MFUOptimizerWrapper:
                 output = model(**batch)
                 loss = output.loss
                 loss.backward()
-                optimizer.step()
+            optimizer.step()   # outside block — excluded from MFU timing
             print(f"MFU={result.mfu:.1%}  MBU={result.mbu:.1%}")
     """
 
@@ -72,6 +73,21 @@ class MFUOptimizerWrapper:
         self._fwd_flops: Optional[int] = None
         self._param_bytes: Optional[int] = None
 
+    def profile(self) -> None:
+        """
+        Explicitly profile FLOPs on the current (uncompiled) model.
+
+        Call this before ``torch.compile`` so the FLOP count is measured on the
+        original graph. If not called, profiling happens lazily on the first
+        ``track_step()`` — which may be too late if the model is already compiled::
+
+            optimizer = MFUOptimizerWrapper(raw_optimizer, model, sample_batch, dtype="bf16")
+            optimizer.profile()          # profile uncompiled model
+            model = torch.compile(model) # compile after profiling
+        """
+        if self._spec is None:
+            self._profile_once()
+
     def _profile_once(self) -> None:
         self._spec = get_gpu_spec(self._device)
         try:
@@ -93,13 +109,24 @@ class MFUOptimizerWrapper:
         Context manager that wraps one training step and populates a
         :class:`~mfu_tracker.UtilizationResult` with MFU and MBU.
 
-        ``optimizer.zero_grad()`` is called automatically when the block exits.
+        ``optimizer.zero_grad()`` is called automatically at the *start* of the
+        block so that ``optimizer.step()`` can be called **after** the block
+        without corrupting gradient state. Timing captures forward + backward
+        only; call ``step()`` outside the block for accurate MFU::
+
+            with wrapped.track_step() as result:
+                out = model(**batch)
+                out.loss.backward()
+            wrapped.step()   # outside — excluded from timing
+
         The backward factor (ratio of backward to forward time) is measured
         dynamically via CUDA events and a gradient hook, so gradient checkpointing
         and other effects are captured without any manual configuration.
         """
         if self._spec is None:
             self._profile_once()
+
+        self.optimizer.zero_grad()
 
         e_start = torch.cuda.Event(enable_timing=True)
         e_bwd = torch.cuda.Event(enable_timing=True)
@@ -125,7 +152,6 @@ class MFUOptimizerWrapper:
         e_start.record()
         try:
             yield result
-            self.optimizer.zero_grad()
         finally:
             e_end.record()
             if handle is not None:

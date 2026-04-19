@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import time
+import warnings
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Generator, Optional
@@ -55,7 +56,19 @@ class UtilizationResult:
             backward_factor = (total_ms - fwd_ms) / fwd_ms if fwd_ms > 0 else 2.0
             total_flops = int(self._fwd_flops * (1 + backward_factor))
         elif self._fwd_flops is not None:
-            total_flops = self._fwd_flops
+            # Backward hook didn't fire — common with torch.compile, which can
+            # restructure the gradient graph so the hook on trainable[-1] is never
+            # called. Fall back to backward_factor=2.0 (standard 3× convention).
+            # stacklevel=2 is approximate; warnings.warn deduplicates by call site.
+            warnings.warn(
+                "mfu-tracker: backward pass not detected via gradient hook "
+                "(this often happens with torch.compile). "
+                "Falling back to backward_factor=2.0; actual MFU may differ slightly.",
+                UserWarning,
+                stacklevel=2,
+            )
+            total_flops = int(self._fwd_flops * 3)
+
         else:
             return
 
