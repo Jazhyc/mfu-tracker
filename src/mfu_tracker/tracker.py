@@ -8,7 +8,6 @@ from typing import Generator, Optional
 
 import torch
 
-from .flops import transformer_flops  # noqa: F401 – re-exported for convenience
 from .gpu import GPUSpec, get_gpu_spec
 
 

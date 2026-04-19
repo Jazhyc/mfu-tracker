@@ -4,21 +4,24 @@ PyPI library for tracking Model FLOPs Utilization (MFU) and Model Bandwidth Util
 
 ## Architecture
 
-- `src/mfu_tracker/gpu.py` — queries `torch.cuda.get_device_properties()` to derive peak TFLOPS and memory bandwidth from first principles (compute capability → tensor cores/SM → peak FLOPs). No per-SKU table; clock speed is queried live.
-- `src/mfu_tracker/flops.py` — FLOP counting formulas (6ND transformer approximation + standalone interface).
-- `src/mfu_tracker/tracker.py` — `track()` context manager and `compute_mfu`/`compute_mbu` standalone functions.
-- `src/mfu_tracker/integrations/hf_trainer.py` — HuggingFace Trainer monkey-patch (call `patch_trainer()` before instantiating).
+- [src/mfu_tracker/gpu.py](src/mfu_tracker/gpu.py) — queries `torch.cuda.get_device_properties()` to derive peak TFLOPS and memory bandwidth from first principles. Uses `_FP16_FLOPS_PER_SM_PER_CLOCK` keyed by `(major, minor)` compute capability tuple (empirically validated against spec sheets). Supports per-dtype peak ceilings (fp16, bf16, int8, fp8, int4, fp4).
+- [src/mfu_tracker/flops.py](src/mfu_tracker/flops.py) — FLOP counting via `thop`. Wraps `thop.profile()` which instruments actual torch ops via hooks — correctly counts only activated expert FLOPs in MoE models. For kwargs-only models (e.g. HF), wraps in a `_KwargsAdapter` since thop calls `model(*inputs)` with no kwargs support.
+- [src/mfu_tracker/tracker.py](src/mfu_tracker/tracker.py) — `track()` context manager and `compute_mfu`/`compute_mbu` standalone functions. All accept a `dtype` parameter to select the correct hardware peak ceiling.
+- [src/mfu_tracker/integrations/hf_trainer.py](src/mfu_tracker/integrations/hf_trainer.py) — `MFUCallback(TrainerCallback)`. Profiles the model once at `on_train_begin` with a user-supplied sample batch, then measures wall time per step to log `mfu` and `mbu` at each logging interval. Does NOT read `state.total_flos` — HF Trainer uses the dense 6ND formula for all models including MoE, overcounting MoE by up to 4×.
 
 ## Key design decisions
 
-- Compute capability major version → tensor cores/SM via `_TENSOR_CORES_PER_SM` dict (only needs updating for new GPU generations).
-- Graceful degradation: unknown compute capability emits a `UserWarning` and uses a conservative fallback.
+- `(major, minor)` tuple keys for GPU lookup — CC 8.0 (A100) and CC 8.6 (RTX 3090) have genuinely different per-SM throughput (1024 vs 512 FP16 FLOPs/SM/clock) despite both being Ampere. Major-version-only keys would be wrong.
+- Ada Lovelace is CC 8.9 — gets FP8 support via a special case in `_fp8_supported()` even though its major version is 8 (below the FP8 min_major of 9 for Hopper).
+- `thop` over `calflops` — calflops unconditionally imports `transformers` in `__init__.py`, making it a 600MB transitive dep that defeats the lightweight goal.
+- HF integration uses `TrainerCallback`, not monkey-patch — cleaner, composable, and avoids patching internal Trainer methods.
+- Graceful degradation: unknown compute capability emits a `UserWarning` and falls back to the closest known major version.
 - MBU is always reported alongside MFU.
 - `src/` layout for correct PyPI packaging (hatchling build backend).
 
 ## Dev setup
 
 ```bash
-pip install -e ".[dev]"
-pytest
+uv add --dev pytest pytest-cov
+.venv/bin/pytest tests/ -v
 ```

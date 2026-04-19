@@ -1,3 +1,3 @@
-from .hf_trainer import patch_trainer
+from .hf_trainer import MFUCallback
 
-__all__ = ["patch_trainer"]
+__all__ = ["MFUCallback"]

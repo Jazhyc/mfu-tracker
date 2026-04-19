@@ -1,24 +1,56 @@
-"""FLOP counting formulas."""
+"""FLOP counting via thop — works for any nn.Module architecture."""
 from __future__ import annotations
 
+from typing import Any, Optional
 
-def transformer_flops(
-    num_params: int,
-    tokens: int,
+import torch
+import torch.nn as nn
+
+
+def profile_flops(
+    model: nn.Module,
+    args: Optional[tuple] = None,
+    kwargs: Optional[dict[str, Any]] = None,
     *,
     with_backward: bool = True,
 ) -> int:
     """
-    Estimate FLOPs for a transformer forward (or forward+backward) pass.
+    Count FLOPs for one forward (or forward+backward) pass through *model*.
 
-    Uses the standard 6ND approximation (Hoffmann et al., Chinchilla):
-      forward  ≈ 2 * N * D
-      backward ≈ 2x forward  →  total ≈ 6 * N * D
+    Uses thop to instrument actual torch ops via hooks, so it correctly
+    handles MoE sparse routing, CNNs, RNNs, and any custom nn.Module —
+    not just dense transformers.
 
     Args:
-        num_params: Total trainable parameter count.
-        tokens:     Number of tokens processed in the step (batch * seq_len).
-        with_backward: Include backward pass (True for training, False for inference).
+        model:         The nn.Module to profile.
+        args:          Positional inputs passed to model(*args, **kwargs).
+        kwargs:        Keyword inputs passed to model(*args, **kwargs).
+        with_backward: Include backward-pass FLOPs (default True for training).
+                       Backward pass is estimated as 2× forward FLOPs, giving
+                       3× forward total — matching the standard 6ND convention.
+
+    Returns:
+        Total integer FLOP count for one step.
     """
-    multiplier = 6 if with_backward else 2
-    return multiplier * num_params * tokens
+    from thop import profile
+
+    # thop calls model(*inputs), so kwargs need to be baked in via a wrapper.
+    if kwargs:
+        _kw = kwargs
+
+        class _KwargsAdapter(nn.Module):
+            def forward(self):
+                return model(**(args[0] if args and isinstance(args[0], dict) else _kw))
+
+        macs, _ = profile(_KwargsAdapter(), inputs=(), verbose=False)
+    else:
+        inputs = args if args is not None else ()
+        macs, _ = profile(model, inputs=inputs, verbose=False)
+    # thop returns MACs; 1 MAC = 2 FLOPs (multiply + accumulate)
+    forward_flops = int(macs * 2)
+    return forward_flops * 3 if with_backward else forward_flops
+
+
+def param_bytes(model: nn.Module) -> int:
+    """Total bytes occupied by all model parameters (for MBU calculation)."""
+    return sum(p.numel() * p.element_size() for p in model.parameters())
