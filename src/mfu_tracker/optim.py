@@ -10,7 +10,7 @@ import torch.nn as nn
 
 from .flops import param_bytes, profile_flops
 from .gpu import GPUSpec, get_gpu_spec
-from .tracker import UtilizationResult, compute_mbu, compute_mfu
+from .tracker import UtilizationResult
 
 
 class MFUOptimizerWrapper:
@@ -120,31 +120,14 @@ class MFUOptimizerWrapper:
             if handle is not None:
                 handle.remove()
 
-            torch.cuda.synchronize(self._device)
-
-            total_ms = e_start.elapsed_time(e_end)
-            elapsed_sec = total_ms / 1000
-
-            if bwd_recorded[0] and self._fwd_flops is not None:
-                fwd_ms = e_start.elapsed_time(e_bwd)
-                bwd_ms = total_ms - fwd_ms
-                backward_factor = bwd_ms / fwd_ms if fwd_ms > 0 else 2.0
-                total_flops = int(self._fwd_flops * (1 + backward_factor))
-            elif self._fwd_flops is not None:
-                # No backward was run (inference-only step).
-                total_flops = self._fwd_flops
-            else:
-                return
-
-            result.elapsed_sec = elapsed_sec
-            result.achieved_tflops = total_flops / elapsed_sec / 1e12
-            result.achieved_tbs = self._param_bytes / elapsed_sec / 1e12
-            result.mfu = compute_mfu(
-                total_flops, elapsed_sec, dtype=self._dtype, spec=self._spec
-            )
-            result.mbu = compute_mbu(
-                self._param_bytes, elapsed_sec, spec=self._spec
-            )
+            # Store events on the result for lazy resolution — no sync here.
+            result._e_start = e_start
+            result._e_bwd = e_bwd
+            result._e_end = e_end
+            result._bwd_recorded = bwd_recorded[0]
+            result._fwd_flops = self._fwd_flops
+            result._param_bytes = self._param_bytes
+            result._device = self._device
 
     # --- Proxy the underlying optimizer ------------------------------------
 

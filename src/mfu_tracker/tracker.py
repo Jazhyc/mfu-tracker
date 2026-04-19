@@ -13,14 +13,102 @@ from .gpu import GPUSpec, get_gpu_spec
 
 @dataclass
 class UtilizationResult:
-    """Mutable result holder — fields are populated after the context block exits."""
-    mfu: Optional[float] = None
-    mbu: Optional[float] = None
-    elapsed_sec: Optional[float] = None
-    achieved_tflops: Optional[float] = None
-    achieved_tbs: Optional[float] = None
+    """
+    Result holder populated after a ``track()`` or ``track_step()`` block exits.
+
+    Fields backed by CUDA events (from ``MFUOptimizerWrapper.track_step()``) are
+    computed lazily on first access — the GPU sync is deferred until the value is
+    actually needed. Fields from the CPU-timed ``track()`` context manager are
+    populated eagerly since ``torch.cuda.synchronize`` is already called there.
+    """
+
     dtype: str = "fp16"
     gpu_spec: Optional[GPUSpec] = None
+
+    # Eagerly-set fields (track()) or lazily-set after _resolve() (track_step()).
+    _mfu: Optional[float] = field(default=None, repr=False)
+    _mbu: Optional[float] = field(default=None, repr=False)
+    _elapsed_sec: Optional[float] = field(default=None, repr=False)
+    _achieved_tflops: Optional[float] = field(default=None, repr=False)
+    _achieved_tbs: Optional[float] = field(default=None, repr=False)
+
+    # Set by MFUOptimizerWrapper for lazy resolution.
+    _e_start: Optional[object] = field(default=None, repr=False)
+    _e_bwd: Optional[object] = field(default=None, repr=False)
+    _e_end: Optional[object] = field(default=None, repr=False)
+    _bwd_recorded: bool = field(default=False, repr=False)
+    _fwd_flops: Optional[int] = field(default=None, repr=False)
+    _param_bytes: Optional[int] = field(default=None, repr=False)
+    _device: Optional[torch.device] = field(default=None, repr=False)
+
+    def _resolve(self) -> None:
+        """Sync and compute all fields from CUDA events. Called at most once."""
+        if self._e_start is None:
+            return
+        torch.cuda.synchronize(self._device)
+        total_ms = self._e_start.elapsed_time(self._e_end)
+        elapsed = total_ms / 1000
+
+        if self._bwd_recorded and self._fwd_flops is not None:
+            fwd_ms = self._e_start.elapsed_time(self._e_bwd)
+            backward_factor = (total_ms - fwd_ms) / fwd_ms if fwd_ms > 0 else 2.0
+            total_flops = int(self._fwd_flops * (1 + backward_factor))
+        elif self._fwd_flops is not None:
+            total_flops = self._fwd_flops
+        else:
+            return
+
+        self._elapsed_sec = elapsed
+        self._achieved_tflops = total_flops / elapsed / 1e12
+        self._achieved_tbs = self._param_bytes / elapsed / 1e12
+        self._mfu = self._achieved_tflops / self.gpu_spec.peak_tflops(self.dtype)
+        self._mbu = self._achieved_tbs / self.gpu_spec.peak_memory_bandwidth_tbs
+        self._e_start = None  # mark resolved
+
+    @property
+    def mfu(self) -> Optional[float]:
+        self._resolve()
+        return self._mfu
+
+    @mfu.setter
+    def mfu(self, v: Optional[float]) -> None:
+        self._mfu = v
+
+    @property
+    def mbu(self) -> Optional[float]:
+        self._resolve()
+        return self._mbu
+
+    @mbu.setter
+    def mbu(self, v: Optional[float]) -> None:
+        self._mbu = v
+
+    @property
+    def elapsed_sec(self) -> Optional[float]:
+        self._resolve()
+        return self._elapsed_sec
+
+    @elapsed_sec.setter
+    def elapsed_sec(self, v: Optional[float]) -> None:
+        self._elapsed_sec = v
+
+    @property
+    def achieved_tflops(self) -> Optional[float]:
+        self._resolve()
+        return self._achieved_tflops
+
+    @achieved_tflops.setter
+    def achieved_tflops(self, v: Optional[float]) -> None:
+        self._achieved_tflops = v
+
+    @property
+    def achieved_tbs(self) -> Optional[float]:
+        self._resolve()
+        return self._achieved_tbs
+
+    @achieved_tbs.setter
+    def achieved_tbs(self, v: Optional[float]) -> None:
+        self._achieved_tbs = v
 
 
 @contextmanager
@@ -43,7 +131,7 @@ def track(
         spec:        Pre-queried GPUSpec; fetched once if not provided.
 
     Yields a :class:`UtilizationResult` whose fields are ``None`` until the block
-    exits, then populated with the measured values.
+    exits, then populated with measured values.
 
     Example::
 
