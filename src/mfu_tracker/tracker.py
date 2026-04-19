@@ -24,6 +24,7 @@ class UtilizationResult:
 
     dtype: str = "fp16"
     gpu_spec: Optional[GPUSpec] = None
+    num_gpus: int = 1
 
     # Eagerly-set fields (track()) or lazily-set after _resolve() (track_step()).
     _mfu: Optional[float] = field(default=None, repr=False)
@@ -58,11 +59,14 @@ class UtilizationResult:
         else:
             return
 
+        peak_tflops = self.gpu_spec.peak_tflops(self.dtype) * self.num_gpus
+        peak_tbs = self.gpu_spec.peak_memory_bandwidth_tbs * self.num_gpus
+
         self._elapsed_sec = elapsed
         self._achieved_tflops = total_flops / elapsed / 1e12
         self._achieved_tbs = self._param_bytes / elapsed / 1e12
-        self._mfu = self._achieved_tflops / self.gpu_spec.peak_tflops(self.dtype)
-        self._mbu = self._achieved_tbs / self.gpu_spec.peak_memory_bandwidth_tbs
+        self._mfu = self._achieved_tflops / peak_tflops
+        self._mbu = self._achieved_tbs / peak_tbs
         self._e_start = None  # mark resolved
 
     @property
@@ -117,6 +121,7 @@ def track(
     param_bytes: int,
     *,
     dtype: str = "fp16",
+    num_gpus: int = 1,
     device: Optional[torch.device] = None,
     spec: Optional[GPUSpec] = None,
 ) -> Generator[UtilizationResult, None, None]:
@@ -127,13 +132,19 @@ def track(
         flop_count:  Total FLOPs for the block (use flops.profile_flops or your own).
         param_bytes: Bytes transferred for weights (num_params * bytes_per_element).
         dtype:       Compute dtype string — "fp16", "bf16", "int8", "fp8", "int4", "fp4".
+        num_gpus:    Number of GPUs to include in the peak ceiling (default 1).
+                     For DDP / FSDP leave this at 1 — ``profile_flops`` returns
+                     per-GPU FLOPs, and per-GPU MFU equals global MFU for data-parallel
+                     jobs (the N factors cancel). Only set this for tensor or pipeline
+                     parallelism, and supply the *full-model* FLOPs as *flop_count*
+                     (not the per-rank FLOPs from ``profile_flops`` on a sharded model).
         device:      CUDA device to measure against (default: current device).
         spec:        Pre-queried GPUSpec; fetched once if not provided.
 
     Yields a :class:`UtilizationResult` whose fields are ``None`` until the block
     exits, then populated with measured values.
 
-    Example::
+    Example — single GPU::
 
         flops = profile_flops(model, args=(sample,), with_backward=True)
         with track(flops, param_bytes(model), dtype="bf16") as result:
@@ -141,11 +152,27 @@ def track(
             loss.backward()
             optimizer.step()
         print(f"MFU={result.mfu:.1%}  MBU={result.mbu:.1%}")
+
+    Example — DDP / FSDP (no num_gpus needed)::
+
+        # profile_flops returns per-GPU FLOPs; per-GPU MFU == global MFU for DDP
+        with track(flops, param_bytes(model), dtype="bf16") as r:
+            ...
+
+    Example — tensor parallelism across 8 GPUs::
+
+        # full_model_flops must be computed analytically (profile_flops sees
+        # only the sharded model and returns 1/8 of the total)
+        with track(full_model_flops, param_bytes(model), dtype="bf16", num_gpus=8) as r:
+            ...
     """
     if spec is None:
         spec = get_gpu_spec(device)
 
-    result = UtilizationResult(dtype=dtype, gpu_spec=spec)
+    peak_tflops = spec.peak_tflops(dtype) * num_gpus
+    peak_tbs = spec.peak_memory_bandwidth_tbs * num_gpus
+
+    result = UtilizationResult(dtype=dtype, gpu_spec=spec, num_gpus=num_gpus)
 
     torch.cuda.synchronize(device)
     t0 = time.perf_counter()
@@ -156,8 +183,8 @@ def track(
     result.elapsed_sec = elapsed
     result.achieved_tflops = flop_count / elapsed / 1e12
     result.achieved_tbs = param_bytes / elapsed / 1e12
-    result.mfu = result.achieved_tflops / spec.peak_tflops(dtype)
-    result.mbu = result.achieved_tbs / spec.peak_memory_bandwidth_tbs
+    result.mfu = result.achieved_tflops / peak_tflops
+    result.mbu = result.achieved_tbs / peak_tbs
 
 
 def compute_mfu(
@@ -165,23 +192,35 @@ def compute_mfu(
     elapsed_sec: float,
     *,
     dtype: str = "fp16",
+    num_gpus: int = 1,
     device: Optional[torch.device] = None,
     spec: Optional[GPUSpec] = None,
 ) -> float:
-    """Standalone MFU calculation without a context manager."""
+    """
+    Standalone MFU calculation without a context manager.
+
+    Args:
+        num_gpus: GPUs in the peak ceiling. See :func:`track` for guidance.
+    """
     if spec is None:
         spec = get_gpu_spec(device)
-    return (flop_count / elapsed_sec / 1e12) / spec.peak_tflops(dtype)
+    return (flop_count / elapsed_sec / 1e12) / (spec.peak_tflops(dtype) * num_gpus)
 
 
 def compute_mbu(
     param_bytes: int,
     elapsed_sec: float,
     *,
+    num_gpus: int = 1,
     device: Optional[torch.device] = None,
     spec: Optional[GPUSpec] = None,
 ) -> float:
-    """Standalone MBU calculation without a context manager."""
+    """
+    Standalone MBU calculation without a context manager.
+
+    Args:
+        num_gpus: GPUs in the peak ceiling. See :func:`track` for guidance.
+    """
     if spec is None:
         spec = get_gpu_spec(device)
-    return (param_bytes / elapsed_sec / 1e12) / spec.peak_memory_bandwidth_tbs
+    return (param_bytes / elapsed_sec / 1e12) / (spec.peak_memory_bandwidth_tbs * num_gpus)

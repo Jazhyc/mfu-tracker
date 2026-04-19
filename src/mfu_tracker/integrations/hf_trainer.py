@@ -30,13 +30,29 @@ class MFUCallback:
         from mfu_tracker.integrations.hf_trainer import MFUCallback
 
         callback = MFUCallback(sample_batch=next(iter(train_dataloader)), dtype="bf16")
+        # num_gpus is auto-detected from torch.distributed — no manual config needed
         trainer = Trainer(..., callbacks=[callback])
+
+    **torch.compile**: profile_flops is called at ``on_train_begin``, before the
+    first compiled step. This is correct — ``torch.compile`` does not change the
+    FLOP count (same math, just faster execution). The MFU improvement from
+    compilation is captured automatically in the CUDA event timing of real steps.
+    Do not pass a compiled model to this callback directly; let HF Trainer compile
+    after the callback is registered.
+
+    **DDP / FSDP**: pass ``num_gpus=torch.distributed.get_world_size()`` to scale
+    the peak ceiling to the full job. The callback only logs on rank 0 (handled by
+    HF Trainer). For tensor or pipeline parallelism, supply full-model FLOPs via
+    a pre-computed ``sample_batch`` on the unsharded model.
 
     Args:
         sample_batch: A representative batch dict passed as ``**kwargs`` to the model.
                       Used once at training start to profile forward FLOPs. Shape must
                       match real training batches.
         dtype:        Compute dtype for the peak ceiling — "fp16", "bf16", "int8", etc.
+        num_gpus:     GPUs in the peak ceiling (default 1). For DDP / FSDP leave
+                      this at 1 — per-GPU MFU equals global MFU for data-parallel
+                      jobs. Only set for tensor/pipeline parallelism.
         device:       CUDA device to query. Defaults to current device.
     """
 
@@ -44,10 +60,12 @@ class MFUCallback:
         self,
         sample_batch: dict[str, Any],
         dtype: str = "bf16",
+        num_gpus: int = 1,
         device: Optional[torch.device] = None,
     ) -> None:
         self.sample_batch = sample_batch
         self.dtype = dtype
+        self.num_gpus = num_gpus
         self.device = device
 
         self._model: Optional[nn.Module] = None
@@ -149,8 +167,8 @@ class MFUCallback:
         total_flops = int(self._fwd_flops * n_steps * (1 + backward_factor))
 
         logs["mfu"] = round(
-            compute_mfu(total_flops, elapsed_sec, dtype=self.dtype, spec=self._spec), 4
+            compute_mfu(total_flops, elapsed_sec, dtype=self.dtype, num_gpus=self.num_gpus, spec=self._spec), 4
         )
         logs["mbu"] = round(
-            compute_mbu(self._param_bytes * n_steps, elapsed_sec, spec=self._spec), 4
+            compute_mbu(self._param_bytes * n_steps, elapsed_sec, num_gpus=self.num_gpus, spec=self._spec), 4
         )

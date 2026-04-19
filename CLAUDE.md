@@ -21,6 +21,8 @@ PyPI library for tracking Model FLOPs Utilization (MFU) and Model Bandwidth Util
 - HF integration uses `TrainerCallback`, not monkey-patch — cleaner, composable, and avoids patching internal Trainer methods.
 - Graceful degradation: unknown compute capability emits a `UserWarning` and falls back to the closest known major version.
 - MBU is always reported alongside MFU.
+- `num_gpus` parameter on `track()`, `compute_mfu()`, `compute_mbu()`, `MFUCallback`, and `MFUOptimizerWrapper` scales the peak ceiling. Default 1. **DDP / FSDP: leave at 1.** `profile_flops` returns per-GPU FLOPs; per-GPU MFU = global MFU for data-parallel jobs (the N factors cancel in numerator and denominator). **Tensor / pipeline parallelism**: each GPU runs 1/N of the model, so `profile_flops` on a sharded model undercounts by N. Supply full-model FLOPs analytically and set `num_gpus=N`.
+- `torch.compile` does not change FLOP count (same math, faster execution). Profile the *uncompiled* model — `FlopCounterMode` may not trace compiled graphs correctly. The MFU improvement from compilation is captured automatically via CUDA event timing of real steps.
 - `src/` layout for correct PyPI packaging (hatchling build backend).
 
 ## Testing

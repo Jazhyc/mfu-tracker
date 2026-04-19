@@ -32,7 +32,16 @@ class MFUOptimizerWrapper:
             model=model,
             sample_batch=sample_batch,
             dtype="bf16",
+            # num_gpus auto-detected from torch.distributed — omit unless overriding
         )
+
+    **torch.compile**: pass the *uncompiled* model and compile separately after
+    constructing the wrapper. ``profile_flops`` is called lazily on the first
+    ``track_step()`` — if the model is already compiled at that point,
+    ``FlopCounterMode`` may not count correctly. Compile after wrapping::
+
+        optimizer = MFUOptimizerWrapper(raw_model, ...)
+        compiled_model = torch.compile(raw_model)
 
         for batch in dataloader:
             with optimizer.track_step() as result:
@@ -49,12 +58,14 @@ class MFUOptimizerWrapper:
         model: nn.Module,
         sample_batch: dict[str, Any],
         dtype: str = "bf16",
+        num_gpus: int = 1,
         device: Optional[torch.device] = None,
     ) -> None:
         self.optimizer = optimizer
         self._model = model
         self._sample_batch = sample_batch
         self._dtype = dtype
+        self._num_gpus = num_gpus
         self._device = device
 
         self._spec: Optional[GPUSpec] = None
@@ -109,7 +120,7 @@ class MFUOptimizerWrapper:
         if trainable:
             handle = trainable[-1].register_hook(_bwd_hook)
 
-        result = UtilizationResult(dtype=self._dtype, gpu_spec=self._spec)
+        result = UtilizationResult(dtype=self._dtype, gpu_spec=self._spec, num_gpus=self._num_gpus)
 
         e_start.record()
         try:

@@ -42,6 +42,58 @@ def test_compute_mbu_exact():
     assert compute_mbu(param_bytes, elapsed, spec=spec) == pytest.approx(0.5)
 
 
+def test_compute_mfu_num_gpus_halves_result():
+    spec = _mock_spec(peak_tflops=100.0)
+    flops = int(50e12)
+    mfu_1 = compute_mfu(flops, 1.0, spec=spec, num_gpus=1)
+    mfu_2 = compute_mfu(flops, 1.0, spec=spec, num_gpus=2)
+    assert mfu_1 == pytest.approx(mfu_2 * 2)
+
+
+def test_compute_mbu_num_gpus_halves_result():
+    spec = _mock_spec(peak_tbs=2.0)
+    mbu_1 = compute_mbu(int(1e12), 1.0, spec=spec, num_gpus=1)
+    mbu_2 = compute_mbu(int(1e12), 1.0, spec=spec, num_gpus=2)
+    assert mbu_1 == pytest.approx(mbu_2 * 2)
+
+
+def test_track_num_gpus_scales_peak():
+    spec = _mock_spec(peak_tflops=100.0, peak_tbs=2.0)
+    flops = int(50e12)
+    p_bytes = int(1e12)
+    elapsed_s = 1.0
+
+    with (
+        patch("torch.cuda.synchronize"),
+        patch("mfu_tracker.tracker.time") as mock_time,
+    ):
+        mock_time.perf_counter.side_effect = [0.0, elapsed_s]
+        with track(flops, p_bytes, spec=spec, num_gpus=2) as result:
+            pass
+
+    # Peak doubled → MFU and MBU halved vs single-GPU
+    assert result.mfu == pytest.approx(0.25)
+    assert result.mbu == pytest.approx(0.25)
+
+
+def test_num_gpus_default_is_1():
+    """Default num_gpus=1 is correct for DDP — per-GPU MFU equals global MFU."""
+    spec = _mock_spec(peak_tflops=100.0, peak_tbs=2.0)
+    flops = int(50e12)
+    p_bytes = int(1e12)
+
+    with (
+        patch("torch.cuda.synchronize"),
+        patch("mfu_tracker.tracker.time") as mock_time,
+    ):
+        mock_time.perf_counter.side_effect = [0.0, 1.0]
+        with track(flops, p_bytes, spec=spec) as result:
+            pass
+
+    assert result.num_gpus == 1
+    assert result.mfu == pytest.approx(0.5)
+
+
 def test_mfu_above_one_possible_on_bad_spec():
     """MFU > 1 signals our peak ceiling is wrong — not clamped, so the user sees it."""
     spec = _mock_spec(peak_tflops=10.0)  # underestimated peak
