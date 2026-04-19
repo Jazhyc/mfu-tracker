@@ -132,12 +132,13 @@ def track(
         flop_count:  Total FLOPs for the block (use flops.profile_flops or your own).
         param_bytes: Bytes transferred for weights (num_params * bytes_per_element).
         dtype:       Compute dtype string — "fp16", "bf16", "int8", "fp8", "int4", "fp4".
-        num_gpus:    Number of GPUs to include in the peak ceiling (default 1).
-                     For DDP / FSDP leave this at 1 — ``profile_flops`` returns
-                     per-GPU FLOPs, and per-GPU MFU equals global MFU for data-parallel
-                     jobs (the N factors cancel). Only set this for tensor or pipeline
-                     parallelism, and supply the *full-model* FLOPs as *flop_count*
-                     (not the per-rank FLOPs from ``profile_flops`` on a sharded model).
+        num_gpus:    Multiplier applied to the peak ceiling (default 1). When using
+                     ``profile_flops`` as the source of *flop_count*, leave this at 1
+                     regardless of parallelism strategy — ``profile_flops`` returns
+                     per-GPU FLOPs, and per-GPU MFU equals global MFU for all standard
+                     parallelism types (the N factors cancel). Only set this when
+                     *flop_count* is the analytically-derived *full-model* FLOP count
+                     (e.g. ``6 × params × tokens``) rather than a profiled per-GPU count.
         device:      CUDA device to measure against (default: current device).
         spec:        Pre-queried GPUSpec; fetched once if not provided.
 
@@ -153,17 +154,11 @@ def track(
             optimizer.step()
         print(f"MFU={result.mfu:.1%}  MBU={result.mbu:.1%}")
 
-    Example — DDP / FSDP (no num_gpus needed)::
+    Example — any parallelism strategy (DDP, FSDP, tensor, pipeline)::
 
-        # profile_flops returns per-GPU FLOPs; per-GPU MFU == global MFU for DDP
+        # profile_flops on whatever model shard the local rank holds gives
+        # per-GPU FLOPs; per-GPU MFU == global MFU for all standard strategies.
         with track(flops, param_bytes(model), dtype="bf16") as r:
-            ...
-
-    Example — tensor parallelism across 8 GPUs::
-
-        # full_model_flops must be computed analytically (profile_flops sees
-        # only the sharded model and returns 1/8 of the total)
-        with track(full_model_flops, param_bytes(model), dtype="bf16", num_gpus=8) as r:
             ...
     """
     if spec is None:
