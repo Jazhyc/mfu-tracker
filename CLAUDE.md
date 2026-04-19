@@ -6,24 +6,45 @@ PyPI library for tracking Model FLOPs Utilization (MFU) and Model Bandwidth Util
 
 - [src/mfu_tracker/gpu.py](src/mfu_tracker/gpu.py) — queries `torch.cuda.get_device_properties()` to derive peak TFLOPS and memory bandwidth from first principles. Uses `_FP16_FLOPS_PER_SM_PER_CLOCK` keyed by `(major, minor)` compute capability tuple (empirically validated against spec sheets). Supports per-dtype peak ceilings (fp16, bf16, int8, fp8, int4, fp4).
 - [src/mfu_tracker/flops.py](src/mfu_tracker/flops.py) — FLOP counting via `torch.utils.flop_counter.FlopCounterMode` (PyTorch 2.1+), with `thop` as fallback. `FlopCounterMode` hooks at the ATen dispatch level, so it counts `F.scaled_dot_product_attention` (SDPA / native flash attention) automatically on CUDA — no manual correction needed for modern transformer models. SDPA is NOT counted on CPU (the kernel dispatches differently); profile with a CUDA model for accurate counts. `thop` fallback handles PyTorch < 2.1. For the rare `flash_attn` C extension (direct `flash_attn_func` calls), use `flash_attn_flops(B, S, H, D)` to compute the missing FLOPs manually. For kwargs-only models (e.g. HF), both paths wrap in `_KwargsAdapter`. `param_bytes()` accepts `trainable_only=True` for PEFT/LoRA backward MBU estimates.
-- [src/mfu_tracker/tracker.py](src/mfu_tracker/tracker.py) — `track()` context manager and `compute_mfu`/`compute_mbu` standalone functions. All accept a `dtype` parameter. `UtilizationResult` is a mutable dataclass yielded by `track()`; fields start as `None` and are populated after the block exits. Note: `return value` inside `@contextmanager` is silently swallowed by `contextlib` — the correct pattern is to yield the result object and mutate it after the block.
-- [src/mfu_tracker/optim.py](src/mfu_tracker/optim.py) — `MFUOptimizerWrapper`. Wraps any `torch.optim.Optimizer` and exposes a `track_step()` context manager. Backward factor is measured dynamically: a gradient hook on `trainable[-1]` (last parameter in forward order = first to receive gradients in backward) fires a CUDA event at the start of backward; `backward_factor = bwd_ms / fwd_ms` is derived from CUDA event timings. Gradient checkpointing and other recomputation effects are captured automatically. `zero_grad()` is called automatically on block exit.
-- [src/mfu_tracker/integrations/hf_trainer.py](src/mfu_tracker/integrations/hf_trainer.py) — `MFUCallback(TrainerCallback)`. Profiles the model once at `on_train_begin` with a user-supplied sample batch, then measures wall time per step to log `mfu` and `mbu` at each logging interval. Does NOT read `state.total_flos` — HF Trainer uses the dense 6ND formula for all models including MoE, overcounting MoE by up to 4×. Uses same gradient hook + CUDA event technique as `MFUOptimizerWrapper` but defers `torch.cuda.synchronize()` to `on_log`, so the per-step GPU overhead is three non-blocking `Event.record()` calls only.
+- [src/mfu_tracker/tracker.py](src/mfu_tracker/tracker.py) — `track()` context manager and `compute_mfu`/`compute_mbu` standalone functions. All accept a `dtype` parameter. `UtilizationResult` is a mutable dataclass yielded by `track()`; fields start as `None` and are populated after the block exits. CUDA-event-backed fields (from `track_step()`) are resolved lazily on first attribute access; `_resolve()` is idempotent and calls `synchronize` exactly once.
+- [src/mfu_tracker/optim.py](src/mfu_tracker/optim.py) — `MFUOptimizerWrapper`. Wraps any `torch.optim.Optimizer` and exposes a `track_step()` context manager. Uses a fixed `backward_factor` (default 2.0, the standard 3× convention) — no gradient hook. `zero_grad()` is called automatically at the **start** of `track_step()`; call `optimizer.step()` **after** the block to keep it outside the timing window. Profile the uncompiled model via `wrapper.profile()` before calling `torch.compile`.
+- [src/mfu_tracker/integrations/hf_trainer.py](src/mfu_tracker/integrations/hf_trainer.py) — `MFUCallback(TrainerCallback)`. Profiles the model once at `on_train_begin` (moves sample batch to model device automatically). Records two non-blocking CUDA events per step (`on_step_begin` / `on_step_end`), defers `torch.cuda.synchronize()` to `on_log` amortised across the logging interval. Logs `throughput/mfu` and `throughput/mbu` (configurable prefix). Does NOT read `state.total_flos` — HF Trainer uses the dense 6ND formula for all models including MoE, overcounting MoE by up to 4×. Skips silently when CUDA is unavailable.
 
 ## Key design decisions
 
 - `(major, minor)` tuple keys for GPU lookup — CC 8.0 (A100) and CC 8.6 (RTX 3090) have genuinely different per-SM throughput (1024 vs 512 FP16 FLOPs/SM/clock) despite both being Ampere. Major-version-only keys would be wrong.
 - Ada Lovelace is CC 8.9 — gets FP8 support via a special case in `_fp8_supported()` even though its major version is 8 (below the FP8 min_major of 9 for Hopper).
 - `thop` over `calflops` — calflops unconditionally imports `transformers` in `__init__.py`, making it a 600MB transitive dep that defeats the lightweight goal.
-- Dynamic backward factor via gradient hook — avoids requiring users to know about gradient checkpointing or set a `backward_factor` manually. Hooking `trainable[-1]` works because backward traverses parameters in reverse forward order.
-- `UtilizationResult` is mutable (no `frozen=True`) so the context manager pattern works correctly — yield first, populate after block exits. Fields from `track_step()` (CUDA-event-backed) are lazily resolved on first attribute access; `_resolve()` is idempotent and calls `synchronize` exactly once.
-- `MFUOptimizerWrapper.track_step()` is also lazy — no `synchronize` in `finally`, only on first attribute access of the result. This means skipping `result.mfu` on some steps incurs zero sync cost for those steps.
-- HF integration uses `TrainerCallback`, not monkey-patch — cleaner, composable, and avoids patching internal Trainer methods.
+- **Fixed backward factor, not dynamic measurement.** The original design used a gradient hook on `trainable[-1]` to measure the forward/backward time split dynamically. This was abandoned because: (1) gradient hooks fire on the CPU autograd thread based on scheduling, not GPU completion — making the "start of backward" event unreliable; (2) with `optimizer.step()` inside the timing window, the measured factor absorbed optimizer time and gave ~4× instead of ~2×; (3) `torch.compile` restructures the backward graph so the hook often never fires, producing inconsistent FLOP multipliers between compiled and uncompiled runs. Fixed `backward_factor=2.0` (3× convention) with a user-overridable parameter is simpler and consistent. Users with gradient checkpointing set `backward_factor=3.0–4.0` explicitly.
+- `optimizer.step()` belongs **outside** `track_step()`. `zero_grad()` is called at the start of the block so gradients are valid until the block exits. This way timing captures forward + backward only.
+- `UtilizationResult` is mutable (no `frozen=True`) so the context manager pattern works correctly — yield first, populate after block exits.
+- `MFUOptimizerWrapper.track_step()` is lazy — no `synchronize` in `finally`, only on first attribute access of the result. Skipping `result.mfu` on some steps incurs zero sync cost for those steps.
+- HF integration uses `TrainerCallback`, not monkey-patch — cleaner, composable, and avoids patching internal Trainer methods. `MFUCallback` inherits from `TrainerCallback` so HF Trainer can call all callback events on it.
+- `metric_prefix="throughput"` on `MFUCallback` — logs `throughput/mfu` and `throughput/mbu`. WandB groups metrics by `/` separator, placing these in their own "throughput" section away from `loss`/`lr`. Set `metric_prefix=""` for bare keys.
+- HF Trainer forwards the `logs` dict from `on_log` to all configured integrations (WandB, TensorBoard, MLflow) automatically — no extra configuration needed.
 - Graceful degradation: unknown compute capability emits a `UserWarning` and falls back to the closest known major version.
 - MBU is always reported alongside MFU.
 - `num_gpus` parameter on `track()`, `compute_mfu()`, `compute_mbu()`, `MFUCallback`, and `MFUOptimizerWrapper` scales the peak ceiling. Default 1, correct for all parallelism strategies when using `profile_flops` — per-GPU MFU equals global MFU for DDP, FSDP, tensor, and pipeline parallelism because the N factors cancel (per-GPU FLOPs = total/N, wall time is the same across all GPUs). Only set `num_gpus > 1` when pairing analytically-derived full-model FLOPs (e.g. `6 × params × tokens`) with a total-job peak.
 - `torch.compile` does not change FLOP count (same math, faster execution). Profile the *uncompiled* model — `FlopCounterMode` may not trace compiled graphs correctly. The MFU improvement from compilation is captured automatically via CUDA event timing of real steps.
 - `src/` layout for correct PyPI packaging (hatchling build backend).
+
+## Benchmark findings (RTX 4080, GPT-2 124M, fp16)
+
+From `examples/benchmark_mfu.py` — uses `track()` with `profile_flops(with_backward=True)` (fixed 3× convention) for consistent results across all configurations:
+
+| Configuration         | MFU   | ms/step |
+|-----------------------|-------|---------|
+| batch=1  \| eager     | ~2.7% | ~40ms   |
+| batch=8  \| eager     | ~9%   | ~93ms   |
+| batch=8  \| sdpa      | ~12%  | ~74ms   |
+| batch=8  \| sdpa+compile | ~17% | ~50ms |
+| batch=16 \| sdpa+compile | ~16% | ~104ms |
+
+Key observations:
+- Low MFU (~2–17%) is expected for GPT-2 on modern hardware — the model is too small to saturate tensor cores. Large models (LLaMA-70B) reach 40–60% MFU.
+- Low MBU (~0.2–0.7%) at batch≥4 means memory bandwidth is **not** the bottleneck — the model is compute-bound (or kernel-launch-bound). MBU is more meaningful for inference at batch=1.
+- Both low MFU and low MBU simultaneously indicates **kernel launch overhead**: the GPU idles between small operations waiting for the CPU to dispatch the next kernel. `torch.compile` addresses this by fusing kernels, giving +5–8pp MFU improvement.
+- `sdpa` over `eager` attention: +2–3pp MFU from avoiding materialising the full B×H×S×S attention matrix (flash attention tiling).
 
 ## Testing
 
@@ -38,11 +59,17 @@ Known faithfulness limitations:
 - SDPA is not counted when profiling on CPU — profile the CUDA model for accurate counts.
 - bitsandbytes INT8/NF4 quantized layers (QLoRA) are opaque CUDA kernels not visible to either counter. NF4 dequantizes to fp16 before matmul so FLOPs are approximately correct. Pass `dtype="int8"` to get the right peak ceiling.
 - CUDA event timing is accurate; CPU-timer `track()` requires a `synchronize` at block boundaries.
+- The dynamic backward factor measurement (gradient hook on `trainable[-1]`) was removed — it gave unreliable results (~4× instead of ~2×) due to CPU/GPU async timing and broke comparisons between compiled/uncompiled models.
 
-`transformers` is a dev dependency (needed to test `MFUCallback` without installing the `hf` optional extra).
+`transformers` and `accelerate` are dev dependencies (needed to test `MFUCallback` and run the HF Trainer example).
 
 ```bash
 uv sync --group dev
 .venv/bin/pytest tests/ -v                          # mock tests only (no GPU needed)
 .venv/bin/pytest tests/test_integration_gpu.py -v  # GPU tests
 ```
+
+## Examples
+
+- `examples/benchmark_mfu.py` — benchmarks MFU/MBU across batch size, attention implementation (`eager` vs `sdpa`), and `torch.compile` using GPT-2 (124M). Uses `track()` with pre-profiled FLOPs for consistent results.
+- `examples/hf_trainer_mfu.py` — demonstrates `MFUCallback` with HF Trainer on synthetic data. Metrics appear as `throughput/mfu` / `throughput/mbu` in training logs and WandB. Run with `--wandb` to enable WandB logging.
