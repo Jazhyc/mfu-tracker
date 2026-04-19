@@ -6,13 +6,14 @@ from typing import Any, Optional
 
 import torch
 import torch.nn as nn
+from transformers import TrainerCallback
 
 from ..flops import param_bytes, profile_flops
 from ..gpu import GPUSpec, get_gpu_spec
 from ..tracker import compute_mbu, compute_mfu
 
 
-class MFUCallback:
+class MFUCallback(TrainerCallback):
     """
     TrainerCallback that logs MFU and MBU at every Trainer logging step.
 
@@ -49,6 +50,10 @@ class MFUCallback:
         num_gpus:        GPUs in the peak ceiling (default 1).
         backward_factor: Multiplier for backward pass cost (default 2.0). Set
                          higher when using gradient checkpointing (typical: 3.0–4.0).
+        metric_prefix:   Prefix for logged metric names (default ``"throughput"``).
+                         Results in ``throughput/mfu`` and ``throughput/mbu``, which
+                         WandB groups into its own section away from loss/lr. Set to
+                         ``""`` to log bare ``mfu`` / ``mbu`` keys.
         device:          CUDA device to query. Defaults to current device.
     """
 
@@ -58,12 +63,14 @@ class MFUCallback:
         dtype: str = "bf16",
         num_gpus: int = 1,
         backward_factor: float = 2.0,
+        metric_prefix: str = "throughput",
         device: Optional[torch.device] = None,
     ) -> None:
         self.sample_batch = sample_batch
         self.dtype = dtype
         self.num_gpus = num_gpus
         self.backward_factor = backward_factor
+        self.metric_prefix = metric_prefix
         self.device = device
 
         self._model: Optional[nn.Module] = None
@@ -79,8 +86,14 @@ class MFUCallback:
         self._spec = get_gpu_spec(self.device)
         self._param_bytes = param_bytes(model)
         try:
+            # Move sample batch to the model's device (Trainer may have moved the model).
+            model_device = next(model.parameters()).device
+            batch = {
+                k: v.to(model_device) if isinstance(v, torch.Tensor) else v
+                for k, v in self.sample_batch.items()
+            }
             self._fwd_flops = profile_flops(
-                model, kwargs=self.sample_batch, with_backward=False
+                model, kwargs=batch, with_backward=False
             )
         except Exception as exc:
             warnings.warn(
@@ -91,12 +104,12 @@ class MFUCallback:
     # --- TrainerCallback protocol -------------------------------------------
 
     def on_train_begin(self, args, state, control, model=None, **kwargs):
-        if model is not None:
+        if model is not None and torch.cuda.is_available():
             self._model = model
             self._profile(model)
 
     def on_step_begin(self, args, state, control, **kwargs):
-        if self._fwd_flops is None:
+        if self._fwd_flops is None or not torch.cuda.is_available():
             return
 
         e_start = torch.cuda.Event(enable_timing=True)
@@ -130,9 +143,10 @@ class MFUCallback:
 
         total_flops = int(self._fwd_flops * n_steps * (1 + self.backward_factor))
 
-        logs["mfu"] = round(
+        prefix = f"{self.metric_prefix}/" if self.metric_prefix else ""
+        logs[f"{prefix}mfu"] = round(
             compute_mfu(total_flops, elapsed_sec, dtype=self.dtype, num_gpus=self.num_gpus, spec=self._spec), 4
         )
-        logs["mbu"] = round(
+        logs[f"{prefix}mbu"] = round(
             compute_mbu(self._param_bytes * n_steps, elapsed_sec, num_gpus=self.num_gpus, spec=self._spec), 4
         )

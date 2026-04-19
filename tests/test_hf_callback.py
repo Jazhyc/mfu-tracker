@@ -113,10 +113,10 @@ def test_on_log_computes_mfu_mbu():
     with patch("torch.cuda.synchronize"):
         cb.on_log(_dummy_args(), _dummy_state(), _dummy_control(), logs=logs)
 
-    assert "mfu" in logs
-    assert "mbu" in logs
-    assert isinstance(logs["mfu"], float)
-    assert isinstance(logs["mbu"], float)
+    assert "throughput/mfu" in logs
+    assert "throughput/mbu" in logs
+    assert isinstance(logs["throughput/mfu"], float)
+    assert isinstance(logs["throughput/mbu"], float)
     assert cb._pending == []  # flushed
 
 
