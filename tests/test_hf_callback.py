@@ -100,17 +100,13 @@ def test_on_log_computes_mfu_mbu():
     cb._spec.peak_tflops.return_value = 156.0
     cb._spec.peak_memory_bandwidth_tbs = 2.0
 
-    # Simulate two accumulated steps: 30ms forward, 70ms total each
+    # Simulate two accumulated steps: 70ms each
     e_start = MagicMock()
-    e_bwd = MagicMock()
     e_end = MagicMock()
-    e_start.elapsed_time.side_effect = lambda other: (
-        70.0 if other is e_end else 30.0
-    )
-    bwd_recorded = [True]
+    e_start.elapsed_time.return_value = 70.0
     cb._pending = [
-        (e_start, e_bwd, e_end, bwd_recorded),
-        (e_start, e_bwd, e_end, bwd_recorded),
+        (e_start, e_end),
+        (e_start, e_end),
     ]
 
     logs = {}
@@ -138,26 +134,3 @@ def test_on_log_skips_when_logs_is_none():
     cb._fwd_flops = 1_000_000
     # Should not raise
     cb.on_log(_dummy_args(), _dummy_state(), _dummy_control(), logs=None)
-
-
-def test_hook_removed_after_step_end():
-    cb = _make_callback()
-    model = _TinyMLP()
-    cb._model = model
-    cb._fwd_flops = 1_000_000
-    cb._spec = MagicMock()
-    cb._param_bytes = 50_000
-
-    mock_event = MagicMock()
-    mock_handle = MagicMock()
-
-    with (
-        patch("torch.cuda.Event", return_value=mock_event),
-        patch.object(
-            list(model.parameters())[-1], "register_hook", return_value=mock_handle
-        ),
-    ):
-        cb.on_step_begin(_dummy_args(), _dummy_state(), _dummy_control())
-        cb.on_step_end(_dummy_args(), _dummy_state(), _dummy_control())
-
-    mock_handle.remove.assert_called_once()

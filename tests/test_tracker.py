@@ -170,27 +170,19 @@ def test_track_and_compute_mfu_agree():
 # ---------------------------------------------------------------------------
 
 def test_lazy_result_resolves_on_access():
+    """CUDA-event-backed result resolves correctly on first attribute access."""
     spec = _mock_spec(peak_tflops=100.0, peak_tbs=2.0)
 
     e_start = MagicMock()
-    e_bwd = MagicMock()
     e_end = MagicMock()
-    # Total 1000ms, forward 400ms → backward 600ms → factor 1.5
-    e_start.elapsed_time.side_effect = lambda other: (
-        1000.0 if other is e_end else 400.0
-    )
-
-    fwd_flops = int(40e12)   # 40 TFLOPS forward
-    # total flops = 40e12 * (1 + 1.5) = 100e12 → 100 TFLOPS / 1s → MFU 1.0
-    p_bytes = int(1e12)
+    # 1000ms elapsed → 1s; total_flops=100e12 → 100 TFLOPS → MFU 1.0
+    e_start.elapsed_time.return_value = 1000.0
 
     result = UtilizationResult(dtype="fp16", gpu_spec=spec)
     result._e_start = e_start
-    result._e_bwd = e_bwd
     result._e_end = e_end
-    result._bwd_recorded = True
-    result._fwd_flops = fwd_flops
-    result._param_bytes = p_bytes
+    result._total_flops = int(100e12)
+    result._param_bytes = int(1e12)
     result._device = None
 
     with patch("torch.cuda.synchronize"):
@@ -198,52 +190,22 @@ def test_lazy_result_resolves_on_access():
         assert result.mbu == pytest.approx(0.5)
 
 
-def test_bwd_not_recorded_emits_warning_and_uses_3x():
-    """When bwd hook didn't fire, _resolve() warns and assumes backward_factor=2."""
-    import warnings
-    spec = _mock_spec(peak_tflops=100.0, peak_tbs=2.0)
-    e_start = MagicMock()
-    e_start.elapsed_time.return_value = 1000.0  # 1 s total
-
-    result = UtilizationResult(dtype="fp16", gpu_spec=spec)
-    result._e_start = e_start
-    result._e_bwd = MagicMock()
-    result._e_end = MagicMock()
-    result._bwd_recorded = False
-    result._fwd_flops = int(100e12)  # 100 TFLOPS fwd → ×3 = 300 TFLOPS total → MFU 3.0
-    result._param_bytes = int(1e12)
-    result._device = None
-
-    with patch("torch.cuda.synchronize"):
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
-            mfu = result.mfu
-
-    assert any("backward pass not detected" in str(w.message) for w in caught)
-    assert mfu == pytest.approx(3.0)  # 300 TFLOPS / 100 TFLOPS peak = 3.0
-
-
 def test_lazy_result_resolves_only_once():
     """_resolve() must not call synchronize more than once."""
-    import warnings
     spec = _mock_spec()
     e_start = MagicMock()
     e_start.elapsed_time.return_value = 1000.0
 
     result = UtilizationResult(dtype="fp16", gpu_spec=spec)
     result._e_start = e_start
-    result._e_bwd = MagicMock()
     result._e_end = MagicMock()
-    result._bwd_recorded = False
-    result._fwd_flops = int(1e12)
+    result._total_flops = int(1e12)
     result._param_bytes = int(1e9)
     result._device = None
 
     with patch("torch.cuda.synchronize") as mock_sync:
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", UserWarning)
-            _ = result.mfu
-            _ = result.mfu  # second access
-            _ = result.mbu
+        _ = result.mfu
+        _ = result.mfu  # second access
+        _ = result.mbu
 
     mock_sync.assert_called_once()

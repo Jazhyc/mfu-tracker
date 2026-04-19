@@ -56,10 +56,7 @@ def test_track_step_yields_utilization_result():
         wrapper._fwd_flops = 1_000_000
         wrapper._param_bytes = 100_000
         # bwd hook fires: simulate e_bwd recorded at 30ms into step
-        mock_event.elapsed_time.side_effect = [
-            100.0,  # e_start → e_end (total)
-            30.0,   # e_start → e_bwd (forward time)
-        ]
+        mock_event.elapsed_time.return_value = 100.0  # e_start → e_end
 
         with wrapper.track_step() as result:
             pass  # no real forward/backward needed
@@ -80,16 +77,12 @@ def test_track_step_result_fields_populated():
         wrapper._spec.peak_memory_bandwidth_tbs = 2.0
         wrapper._fwd_flops = 1_000_000
         wrapper._param_bytes = 100_000
-        mock_event.elapsed_time.side_effect = [100.0, 30.0]
-
-        # Simulate gradient hook firing by patching bwd_recorded
-        original_ctx = wrapper.track_step
+        mock_event.elapsed_time.return_value = 100.0
 
         with wrapper.track_step() as result:
             pass
 
-    # With no real backward, bwd_recorded stays False → falls back to fwd-only flops.
-    # Result fields should still be populated.
+    # Result fields should be populated after access (lazy resolution via CUDA events).
     assert result.elapsed_sec is not None
     assert result.mfu is not None
     assert result.mbu is not None

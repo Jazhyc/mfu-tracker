@@ -9,21 +9,20 @@ import torch.nn as nn
 
 from ..flops import param_bytes, profile_flops
 from ..gpu import GPUSpec, get_gpu_spec
-from ..tracker import UtilizationResult, compute_mbu, compute_mfu
+from ..tracker import compute_mbu, compute_mfu
 
 
 class MFUCallback:
     """
     TrainerCallback that logs MFU and MBU at every Trainer logging step.
 
-    Uses the same gradient hook + CUDA event technique as ``MFUOptimizerWrapper``
-    to measure the forward/backward split dynamically — gradient checkpointing and
-    recomputation are captured automatically without any configuration.
+    FLOPs per step are ``fwd_flops × (1 + backward_factor)`` where
+    ``backward_factor`` defaults to 2.0 (standard 3× convention). Set it higher
+    when using gradient checkpointing (typical: 3.0–4.0).
 
-    Per-step cost is three non-blocking ``Event.record()`` calls and one Python
-    gradient hook dispatch (~10–50 μs CPU, no GPU stall). The single
-    ``torch.cuda.synchronize()`` is deferred to ``on_log`` and amortised across
-    all steps in the logging interval.
+    Per-step cost is two non-blocking ``Event.record()`` calls (~10 μs CPU, no
+    GPU stall). The single ``torch.cuda.synchronize()`` is deferred to ``on_log``
+    and amortised across all steps in the logging interval.
 
     Usage::
 
@@ -40,20 +39,17 @@ class MFUCallback:
     Do not pass a compiled model to this callback directly; let HF Trainer compile
     after the callback is registered.
 
-    **DDP / FSDP**: pass ``num_gpus=torch.distributed.get_world_size()`` to scale
-    the peak ceiling to the full job. The callback only logs on rank 0 (handled by
-    HF Trainer). For tensor or pipeline parallelism, supply full-model FLOPs via
-    a pre-computed ``sample_batch`` on the unsharded model.
+    **DDP / FSDP**: leave ``num_gpus=1`` — per-GPU MFU equals global MFU for
+    data-parallel jobs.
 
     Args:
-        sample_batch: A representative batch dict passed as ``**kwargs`` to the model.
-                      Used once at training start to profile forward FLOPs. Shape must
-                      match real training batches.
-        dtype:        Compute dtype for the peak ceiling — "fp16", "bf16", "int8", etc.
-        num_gpus:     GPUs in the peak ceiling (default 1). For DDP / FSDP leave
-                      this at 1 — per-GPU MFU equals global MFU for data-parallel
-                      jobs. Only set for tensor/pipeline parallelism.
-        device:       CUDA device to query. Defaults to current device.
+        sample_batch:    A representative batch dict passed as ``**kwargs`` to the
+                         model. Used once at training start to profile forward FLOPs.
+        dtype:           Compute dtype for the peak ceiling — "fp16", "bf16", etc.
+        num_gpus:        GPUs in the peak ceiling (default 1).
+        backward_factor: Multiplier for backward pass cost (default 2.0). Set
+                         higher when using gradient checkpointing (typical: 3.0–4.0).
+        device:          CUDA device to query. Defaults to current device.
     """
 
     def __init__(
@@ -61,11 +57,13 @@ class MFUCallback:
         sample_batch: dict[str, Any],
         dtype: str = "bf16",
         num_gpus: int = 1,
+        backward_factor: float = 2.0,
         device: Optional[torch.device] = None,
     ) -> None:
         self.sample_batch = sample_batch
         self.dtype = dtype
         self.num_gpus = num_gpus
+        self.backward_factor = backward_factor
         self.device = device
 
         self._model: Optional[nn.Module] = None
@@ -74,9 +72,8 @@ class MFUCallback:
         self._param_bytes: Optional[int] = None
 
         # Each entry: (e_start, e_bwd, e_end, bwd_recorded)
-        # Accumulated between on_log calls; flushed on each on_log.
+        # Each entry: (e_start, e_end). Accumulated between on_log calls.
         self._pending: list[tuple] = []
-        self._current_hook_handle = None
 
     def _profile(self, model: nn.Module) -> None:
         self._spec = get_gpu_spec(self.device)
@@ -99,40 +96,21 @@ class MFUCallback:
             self._profile(model)
 
     def on_step_begin(self, args, state, control, **kwargs):
-        if self._fwd_flops is None or self._model is None:
+        if self._fwd_flops is None:
             return
 
         e_start = torch.cuda.Event(enable_timing=True)
-        e_bwd = torch.cuda.Event(enable_timing=True)
         e_end = torch.cuda.Event(enable_timing=True)
-        bwd_recorded = [False]
-
-        def _bwd_hook(grad: torch.Tensor) -> torch.Tensor:
-            if not bwd_recorded[0]:
-                e_bwd.record()
-                bwd_recorded[0] = True
-            return grad
-
-        trainable = [p for p in self._model.parameters() if p.requires_grad]
-        if trainable:
-            self._current_hook_handle = trainable[-1].register_hook(_bwd_hook)
-
         e_start.record()
-        # Stash references so on_step_end can close the interval and read bwd_recorded.
-        self._pending_step = (e_start, e_bwd, e_end, bwd_recorded)
+        self._pending_step = (e_start, e_end)
 
     def on_step_end(self, args, state, control, **kwargs):
         if not hasattr(self, "_pending_step"):
             return
 
-        e_start, e_bwd, e_end, bwd_recorded = self._pending_step
+        e_start, e_end = self._pending_step
         e_end.record()
-
-        if self._current_hook_handle is not None:
-            self._current_hook_handle.remove()
-            self._current_hook_handle = None
-
-        self._pending.append((e_start, e_bwd, e_end, bwd_recorded))
+        self._pending.append((e_start, e_end))
         del self._pending_step
 
     def on_log(self, args, state, control, logs=None, **kwargs):
@@ -143,28 +121,14 @@ class MFUCallback:
         torch.cuda.synchronize(self.device)
 
         n_steps = len(self._pending)
-        total_ms = 0.0
-        fwd_ms = 0.0
-        n_with_bwd = 0
-
-        for e_start, e_bwd, e_end, bwd_recorded in self._pending:
-            total_ms += e_start.elapsed_time(e_end)
-            if bwd_recorded[0]:
-                fwd_ms += e_start.elapsed_time(e_bwd)
-                n_with_bwd += 1
-
+        total_ms = sum(e_start.elapsed_time(e_end) for e_start, e_end in self._pending)
         self._pending.clear()
 
         elapsed_sec = total_ms / 1000
         if elapsed_sec <= 0:
             return
 
-        if n_with_bwd > 0:
-            backward_factor = (total_ms - fwd_ms) / fwd_ms if fwd_ms > 0 else 2.0
-        else:
-            backward_factor = 2.0
-
-        total_flops = int(self._fwd_flops * n_steps * (1 + backward_factor))
+        total_flops = int(self._fwd_flops * n_steps * (1 + self.backward_factor))
 
         logs["mfu"] = round(
             compute_mfu(total_flops, elapsed_sec, dtype=self.dtype, num_gpus=self.num_gpus, spec=self._spec), 4
