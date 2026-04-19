@@ -177,10 +177,11 @@ Leave `num_gpus=1` (the default) when using `profile_flops` as the FLOP source. 
 ## Limitations
 
 - **SDPA on CPU is not counted** — `FlopCounterMode` does not intercept flash attention dispatch on CPU. Profile with a CUDA model.
-- **bitsandbytes quantized layers** — INT8/NF4 kernels are opaque to `FlopCounterMode`. NF4 dequantizes to fp16 before the matmul, so FLOP counts are approximately correct. Pass `dtype="int8"` to use the right peak ceiling.
+- **bitsandbytes quantized layers** — INT8/NF4 kernels are opaque to `FlopCounterMode`. NF4 dequantizes to fp16 before the matmul, so FLOP counts are approximately correct. Pass the appropriate dtype to use the right peak ceiling.
 - **`flash_attn_func` direct calls** — models bypassing `F.scaled_dot_product_attention` need a manual `flash_attn_flops()` correction (see above).
 - **Peak ceilings from spec sheets** — these are not independently measured. MFU > 1.0 indicates the ceiling is underestimated.
 - **MBU is a proxy** — the formula uses parameter bytes as a stand-in for memory traffic; actual DRAM traffic (activations, gradients, optimizer state) is higher and not measured.
+- I have not tested the library extensively yet; please open an issue if you encounter any bugs or unexpected behavior.
 
 ---
 
