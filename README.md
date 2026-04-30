@@ -4,10 +4,10 @@ When profiling training runs, I found that most existing tools either lacked MFU
 
 **mfu-tracker** is a PyTorch library for measuring Model FLOPs Utilization (MFU) and Model Bandwidth Utilization (MBU). It supports bare PyTorch training loops, an optimizer wrapper, and a HuggingFace Trainer callback.
 
-- **Minimal dependencies** — PyTorch and `thop` only
+- **Minimal dependencies** — PyTorch and `thop` only.
 - **Profiled FLOPs, not formula estimates** — uses `FlopCounterMode` to count the FLOPs your model actually executes rather than a formula like `6 × params × tokens`. For Mixture-of-Experts models this means only active experts are counted, giving a more accurate numerator than parameter-based estimates.
-- **Three integration styles** — context manager, optimizer wrapper, HF Trainer callback
-- **WandB / TensorBoard / MLflow** — metrics are logged through HF Trainer's existing pipeline when using `MFUCallback`
+- **Three integration styles** — context manager, optimizer wrapper, HF Trainer callback.
+- **WandB / TensorBoard / MLflow** — metrics are logged through HF Trainer's existing pipeline when using `MFUCallback`.
 
 MFU as a training efficiency metric was introduced in the [PaLM paper](https://arxiv.org/abs/2204.02311) (Chowdhery et al., 2022).
 
