@@ -67,7 +67,7 @@ class GPUSpec:
 def _warn_unknown(cc: tuple[int, int]) -> None:
     warnings.warn(
         f"Unknown compute capability {cc[0]}.{cc[1]}; MFU/MBU results may be inaccurate. "
-        "Please open an issue at https://github.com/your-repo/mfu-tracker.",
+        "Please open an issue at https://github.com/Jazhyc/mfu-tracker.",
         UserWarning,
         stacklevel=3,
     )
