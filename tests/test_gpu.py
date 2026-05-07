@@ -2,7 +2,7 @@
 import pytest
 from unittest.mock import MagicMock, patch
 
-from mfu_tracker.gpu import get_gpu_spec, _FP16_FLOPS_PER_SM_PER_CLOCK
+from mfu_tracker.gpu import get_gpu_spec
 
 
 def _mock_props(major=8, minor=0, sms=108, clock_khz=1_410_000, mem_clock_khz=9751, bus_width=5120, name="A100"):

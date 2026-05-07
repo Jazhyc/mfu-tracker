@@ -8,14 +8,14 @@ import pytest
 import torch
 import torch.nn as nn
 
+from mfu_tracker.flops import param_bytes, profile_flops
+from mfu_tracker.gpu import get_gpu_spec
+from mfu_tracker.tracker import compute_mfu, track
+
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(),
     reason="CUDA GPU required",
 )
-
-from mfu_tracker.flops import param_bytes, profile_flops
-from mfu_tracker.gpu import get_gpu_spec
-from mfu_tracker.tracker import compute_mfu, compute_mbu, track
 
 
 # ---------------------------------------------------------------------------
@@ -143,6 +143,7 @@ def test_mbu_in_unit_interval(gpu_model_and_spec):
         for _ in range(20):
             _ = model(x)
 
+    assert result.mbu is not None
     assert 0 < result.mbu <= 1.5
 
 
@@ -155,6 +156,7 @@ def test_compute_mfu_matches_track(gpu_model_and_spec):
         for _ in range(n):
             _ = model(x)
 
+    assert result.elapsed_sec is not None
     standalone = compute_mfu(flops * n, result.elapsed_sec, dtype="fp16", spec=spec)
     assert result.mfu == pytest.approx(standalone, rel=1e-4)
 

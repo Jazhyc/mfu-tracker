@@ -1,7 +1,6 @@
 """Numerical correctness tests for track() and compute_mfu/mbu."""
 import pytest
 from unittest.mock import MagicMock, patch
-import torch
 
 from mfu_tracker.tracker import UtilizationResult, compute_mbu, compute_mfu, track
 

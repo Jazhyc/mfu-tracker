@@ -1,5 +1,4 @@
 """Tests for MFUCallback — no real GPU needed, CUDA calls mocked."""
-import pytest
 from unittest.mock import MagicMock, patch
 import torch
 import torch.nn as nn

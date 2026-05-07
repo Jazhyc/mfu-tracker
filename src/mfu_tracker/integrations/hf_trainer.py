@@ -127,7 +127,7 @@ class MFUCallback(TrainerCallback):
         del self._pending_step
 
     def on_log(self, args, state, control, logs=None, **kwargs):
-        if logs is None or not self._pending or self._fwd_flops is None:
+        if logs is None or not self._pending or self._fwd_flops is None or self._param_bytes is None:
             return
 
         # Single sync amortised across all accumulated steps.

@@ -178,7 +178,7 @@ def main() -> None:
         result = run(args.model, bs, args.seq_len, attn, compile_, args.steps, args.warmup)
         elapsed = time.time() - t0
         if result is None:
-            print(f" OOM — skipped")
+            print(" OOM — skipped")
         else:
             mfu, mbu, ms = result
             rows.append((label, mfu, mbu, ms))

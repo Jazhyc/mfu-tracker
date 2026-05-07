@@ -61,7 +61,8 @@ def _profile_with_thop(target: nn.Module, call_args: tuple) -> int:
     """Profile using thop — fallback for PyTorch < 2.1 or unsupported models."""
     from thop import profile
 
-    macs, _ = profile(target, inputs=call_args, verbose=False)
+    result = profile(target, inputs=call_args, verbose=False)
+    macs = result[0]
     return int(macs * 2)
 
 

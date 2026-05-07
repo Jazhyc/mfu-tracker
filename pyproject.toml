@@ -30,6 +30,11 @@ packages = ["src/mfu_tracker"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 
+[tool.basedpyright]
+typeCheckingMode = "standard"
+reportPrivateImportUsage = "none"
+exclude = ["examples", ".venv", "**/__pycache__"]
+
 [dependency-groups]
 dev = [
     "accelerate>=1.1.0",

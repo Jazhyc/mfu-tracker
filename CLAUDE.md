@@ -69,6 +69,25 @@ uv sync --group dev
 .venv/bin/pytest tests/test_integration_gpu.py -v  # GPU tests
 ```
 
+## Linting and type checking
+
+After adding a feature or non-trivial change, run both linters and resolve all findings before considering the task done:
+
+```bash
+uvx ruff check .
+uvx basedpyright
+```
+
+Config lives in `pyproject.toml` under `[tool.basedpyright]`:
+- `typeCheckingMode = "standard"` — basedpyright defaults to `"all"`, stricter than pyright's `"strict"` and floods PyTorch code with noise.
+- `reportPrivateImportUsage = "none"` — PyTorch's top-level surface (`torch.relu`, `torch.randn`, `torch.float16`, etc.) isn't formally re-exported in its stubs but is the documented API. Disabling avoids hundreds of false positives.
+- `exclude = ["examples", ...]` — `GPT2Config(n_layer=..., n_head=...)` kwargs go through `**kwargs` in `transformers.PretrainedConfig` and aren't in the stubs. Type-checking examples produces noise without value.
+
+Common patterns when basedpyright flags `Optional[X]` issues in `src/`:
+- For invariants ("field A is None iff field B is None"), add `assert self.b is not None` after the early-return on `a`.
+- For `Optional[float]` fields that get computed then re-read in the same method, compute via a local first then assign — basedpyright doesn't narrow attribute reassignment.
+- For `torch.cuda.Event` and similar runtime-only opaque types, prefer `Any` over `Optional[object]` in dataclass fields.
+
 ## Examples
 
 - `examples/benchmark_mfu.py` — benchmarks MFU/MBU across batch size, attention implementation (`eager` vs `sdpa`), and `torch.compile` using GPT-2 (124M). Uses `track()` with pre-profiled FLOPs for consistent results.

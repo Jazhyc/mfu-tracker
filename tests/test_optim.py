@@ -1,6 +1,5 @@
 """Tests for MFUOptimizerWrapper — CPU-only, CUDA calls mocked."""
-import pytest
-from unittest.mock import MagicMock, patch, PropertyMock
+from unittest.mock import MagicMock, patch
 import torch
 import torch.nn as nn
 
@@ -47,7 +46,7 @@ def test_track_step_yields_utilization_result():
     with (
         patch("torch.cuda.Event", return_value=mock_event),
         patch("torch.cuda.synchronize"),
-        patch.object(wrapper, "_profile_once") as mock_profile,
+        patch.object(wrapper, "_profile_once"),
     ):
         # Simulate a profiled state
         wrapper._spec = MagicMock()

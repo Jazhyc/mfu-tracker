@@ -4,7 +4,7 @@ from __future__ import annotations
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Generator, Optional
+from typing import Any, Generator, Optional
 
 import torch
 
@@ -34,8 +34,8 @@ class UtilizationResult:
     _achieved_tbs: Optional[float] = field(default=None, repr=False)
 
     # Set by MFUOptimizerWrapper for lazy resolution.
-    _e_start: Optional[object] = field(default=None, repr=False)
-    _e_end: Optional[object] = field(default=None, repr=False)
+    _e_start: Any = field(default=None, repr=False)
+    _e_end: Any = field(default=None, repr=False)
     _total_flops: Optional[int] = field(default=None, repr=False)
     _param_bytes: Optional[int] = field(default=None, repr=False)
     _device: Optional[torch.device] = field(default=None, repr=False)
@@ -46,17 +46,21 @@ class UtilizationResult:
             return
         if self._total_flops is None or self._param_bytes is None:
             return
+        assert self.gpu_spec is not None  # set together with _e_start
         torch.cuda.synchronize(self._device)
         elapsed = self._e_start.elapsed_time(self._e_end) / 1000
 
         peak_tflops = self.gpu_spec.peak_tflops(self.dtype) * self.num_gpus
         peak_tbs = self.gpu_spec.peak_memory_bandwidth_tbs * self.num_gpus
 
+        achieved_tflops = self._total_flops / elapsed / 1e12
+        achieved_tbs = self._param_bytes / elapsed / 1e12
+
         self._elapsed_sec = elapsed
-        self._achieved_tflops = self._total_flops / elapsed / 1e12
-        self._achieved_tbs = self._param_bytes / elapsed / 1e12
-        self._mfu = self._achieved_tflops / peak_tflops
-        self._mbu = self._achieved_tbs / peak_tbs
+        self._achieved_tflops = achieved_tflops
+        self._achieved_tbs = achieved_tbs
+        self._mfu = achieved_tflops / peak_tflops
+        self._mbu = achieved_tbs / peak_tbs
         self._e_start = None  # mark resolved
 
     @property
