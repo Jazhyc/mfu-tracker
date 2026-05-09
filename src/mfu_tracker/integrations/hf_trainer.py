@@ -15,11 +15,16 @@ from ..tracker import compute_mbu, compute_mfu
 
 class MFUCallback(TrainerCallback):
     """
-    TrainerCallback that logs MFU and MBU at every Trainer logging step.
+    TrainerCallback that logs MFU, HFU (when applicable), and MBU at every
+    Trainer logging step.
 
-    FLOPs per step are ``fwd_flops × (1 + backward_factor)`` where
-    ``backward_factor`` defaults to 2.0 (standard 3× convention). Set it higher
-    when using gradient checkpointing (typical: 3.0–4.0).
+    MFU follows the algorithmic convention: ``fwd_flops × 3`` (forward + 2×
+    backward). Gradient checkpointing does not affect MFU's numerator —
+    recomputation is a memory optimization, not part of the math. HFU instead
+    uses ``fwd_hfu_flops × (1 + hfu_backward_factor)``. Default ``2.0`` matches
+    MFU (no recomputation). Pass ``3.0`` under full activation checkpointing
+    (Megatron-LM convention: HFU/MFU = 4/3) so HFU reflects the actual FLOPs
+    executed by the hardware.
 
     Per-step cost is two non-blocking ``Event.record()`` calls (~10 μs CPU, no
     GPU stall). The single ``torch.cuda.synchronize()`` is deferred to ``on_log``
@@ -48,8 +53,14 @@ class MFUCallback(TrainerCallback):
                          model. Used once at training start to profile forward FLOPs.
         dtype:           Compute dtype for the peak ceiling — "fp16", "bf16", etc.
         num_gpus:        GPUs in the peak ceiling (default 1).
-        backward_factor: Multiplier for backward pass cost (default 2.0). Set
-                         higher when using gradient checkpointing (typical: 3.0–4.0).
+        hfu_backward_factor: Backward + recomputation cost as a multiple of
+                         forward FLOPs. ``None`` (default) auto-detects from
+                         ``args.gradient_checkpointing``: ``2.0`` if disabled,
+                         ``3.0`` if enabled (full activation checkpointing,
+                         Megatron-LM convention). Pass an explicit float to
+                         override — useful for selective layer checkpointing
+                         (values between 2.0 and 3.0). Does not affect MFU,
+                         which always uses the algorithmic 3× multiplier.
         metric_prefix:   Prefix for logged metric names (default ``"throughput"``).
                          Results in ``throughput/mfu`` and ``throughput/mbu``, which
                          WandB groups into its own section away from loss/lr. Set to
@@ -62,14 +73,14 @@ class MFUCallback(TrainerCallback):
         sample_batch: dict[str, Any],
         dtype: str = "bf16",
         num_gpus: int = 1,
-        backward_factor: float = 2.0,
+        hfu_backward_factor: Optional[float] = None,
         metric_prefix: str = "throughput",
         device: Optional[torch.device] = None,
     ) -> None:
         self.sample_batch = sample_batch
         self.dtype = dtype
         self.num_gpus = num_gpus
-        self.backward_factor = backward_factor
+        self.hfu_backward_factor = hfu_backward_factor
         self.metric_prefix = metric_prefix
         self.device = device
 
@@ -107,6 +118,8 @@ class MFUCallback(TrainerCallback):
     # --- TrainerCallback protocol -------------------------------------------
 
     def on_train_begin(self, args, state, control, model=None, **kwargs):
+        if self.hfu_backward_factor is None:
+            self.hfu_backward_factor = 3.0 if getattr(args, "gradient_checkpointing", False) else 2.0
         if model is not None and torch.cuda.is_available():
             self._model = model
             self._profile(model)
@@ -144,15 +157,23 @@ class MFUCallback(TrainerCallback):
         if elapsed_sec <= 0:
             return
 
-        step_factor = n_steps * (1 + self.backward_factor)
-        total_flops = int(self._fwd_flops * step_factor)
+        # MFU uses the algorithmic 3× convention — independent of recomputation.
+        total_flops = int(self._fwd_flops * n_steps * 3)
+        # HFU uses the user-set or auto-detected factor; default to 2.0 if
+        # on_train_begin never resolved it (e.g. direct on_log calls in tests).
+        hfu_factor = self.hfu_backward_factor if self.hfu_backward_factor is not None else 2.0
+        hfu_step_factor = n_steps * (1 + hfu_factor)
 
         prefix = f"{self.metric_prefix}/" if self.metric_prefix else ""
         logs[f"{prefix}mfu"] = round(
             compute_mfu(total_flops, elapsed_sec, dtype=self.dtype, num_gpus=self.num_gpus, spec=self._spec), 4
         )
-        if self._fwd_hfu_flops is not None and self._fwd_hfu_flops != self._fwd_flops:
-            total_hfu_flops = int(self._fwd_hfu_flops * step_factor)
+        # Emit HFU when it is meaningfully different from MFU — either because the
+        # model uses causal SDPA (fwd_hfu_flops < fwd_flops) or because gradient
+        # checkpointing inflates real backward FLOPs (hfu_factor > 2.0).
+        fwd_hfu = self._fwd_hfu_flops
+        if fwd_hfu is not None and (fwd_hfu != self._fwd_flops or hfu_factor != 2.0):
+            total_hfu_flops = int(fwd_hfu * hfu_step_factor)
             logs[f"{prefix}hfu"] = round(
                 compute_mfu(total_hfu_flops, elapsed_sec, dtype=self.dtype, num_gpus=self.num_gpus, spec=self._spec), 4
             )

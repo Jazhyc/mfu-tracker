@@ -50,6 +50,32 @@ def test_on_train_begin_no_model_is_noop():
     assert cb._fwd_flops is None
 
 
+def test_hfu_backward_factor_autodetected_from_grad_ckpt_off():
+    """No gradient checkpointing → hfu_backward_factor=2.0."""
+    cb = _make_callback()
+    assert cb.hfu_backward_factor is None  # unresolved at init
+    args = MagicMock(gradient_checkpointing=False)
+    cb.on_train_begin(args, _dummy_state(), _dummy_control(), model=None)
+    assert cb.hfu_backward_factor == 2.0
+
+
+def test_hfu_backward_factor_autodetected_from_grad_ckpt_on():
+    """gradient_checkpointing=True → hfu_backward_factor=3.0 (Megatron convention)."""
+    cb = _make_callback()
+    args = MagicMock(gradient_checkpointing=True)
+    cb.on_train_begin(args, _dummy_state(), _dummy_control(), model=None)
+    assert cb.hfu_backward_factor == 3.0
+
+
+def test_hfu_backward_factor_explicit_value_not_overridden():
+    """User-supplied float survives auto-detection."""
+    sample = {"x": torch.randn(1, 8)}
+    cb = MFUCallback(sample_batch=sample, dtype="fp16", hfu_backward_factor=2.5)
+    args = MagicMock(gradient_checkpointing=True)  # would normally force 3.0
+    cb.on_train_begin(args, _dummy_state(), _dummy_control(), model=None)
+    assert cb.hfu_backward_factor == 2.5
+
+
 def test_on_step_begin_skipped_when_not_profiled():
     """If profiling failed, on_step_begin should do nothing rather than crash."""
     cb = _make_callback()

@@ -129,7 +129,17 @@ flops += flash_attn_flops(batch_size=B, seq_len=S, num_heads=H, head_dim=D)
 p_bytes = param_bytes(model, trainable_only=True)
 ```
 
-`with_backward=True` applies the standard 3× convention (1× forward + 2× backward). For gradient checkpointing, pass `backward_factor=3.0` or `4.0` to `MFUOptimizerWrapper` or `MFUCallback`.
+`with_backward=True` applies the standard algorithmic 3× convention (1× forward + 2× backward). This is the *MFU* convention and does not change under gradient checkpointing — recomputation is a memory optimization, not part of the model's math.
+
+For HFU, pass `hfu_backward_factor` to `MFUOptimizerWrapper`. The HF callback auto-detects from `TrainingArguments.gradient_checkpointing`, so you typically don't need to set it manually — pass an explicit value only for selective layer checkpointing.
+
+| Setup | `hfu_backward_factor` | HFU total multiplier |
+|-------|----------------------|---------------------|
+| No checkpointing (default) | `2.0` | `3×` (matches MFU) |
+| Full activation checkpointing | `3.0` | `4×` (Megatron-LM convention: HFU/MFU = 4/3) |
+| Selective layer checkpointing | between `2.0` and `3.0` | `3.x×` |
+
+The total multiplier is `1 + hfu_backward_factor`. The forward is 1× by definition; the rest is "backward + recomputation work" expressed as a multiple of forward FLOPs.
 
 ### MFU vs HFU
 
@@ -146,7 +156,7 @@ with track(profile.flops, p_bytes, hfu_flop_count=profile.hfu_flops, dtype="bf16
 print(f"MFU={r.mfu:.3f}  HFU={r.hfu:.3f}")
 ```
 
-`HFU < MFU` only when the model uses `is_causal=True` on SDPA; for bidirectional models the two are equal. The HF callback adds `throughput/hfu` alongside `throughput/mfu` only when the values differ.
+`HFU < MFU` only when the model uses `is_causal=True` on SDPA; for bidirectional models the two are equal in the no-checkpointing case. With gradient checkpointing, HFU > MFU because the GPU is doing extra recomputation work (set `hfu_backward_factor=3.0` for full activation checkpointing — see the table above). The HF callback adds `throughput/hfu` alongside `throughput/mfu` whenever the two would differ — either because of causal SDPA, gradient checkpointing, or both.
 
 ---
 

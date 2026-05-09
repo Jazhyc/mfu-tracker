@@ -15,12 +15,21 @@ from .tracker import UtilizationResult
 
 class MFUOptimizerWrapper:
     """
-    Wraps any ``torch.optim.Optimizer`` to automatically track MFU and MBU.
+    Wraps any ``torch.optim.Optimizer`` to automatically track MFU, HFU, and MBU.
 
-    FLOPs are profiled once on the uncompiled model and scaled by
-    ``1 + backward_factor`` (default 2.0, the standard forward + 2× backward
-    convention). Set ``backward_factor`` higher when using gradient checkpointing,
-    which recomputes activations during backward (typical values: 3.0–4.0).
+    FLOPs are profiled once on the uncompiled model. The two metrics differ in
+    how they treat backward and recomputation work:
+
+    * **MFU** (algorithmic) uses a fixed 3× multiplier (forward + 2× backward).
+      Gradient checkpointing does not change MFU's numerator — recomputation
+      is a memory optimization, not part of the model's math. Under
+      checkpointing MFU correctly *drops* (less useful work per second).
+    * **HFU** (hardware) uses ``1 + hfu_backward_factor``. The default ``2.0``
+      assumes no recomputation (matches MFU). Set to ``3.0`` under full
+      activation checkpointing — backward then costs ``2×`` (matmul backward)
+      plus ``1×`` (forward replay) = ``3×`` of forward, giving a ``4×`` total
+      multiplier (HFU/MFU = 4/3, the Megatron-LM convention). Selective
+      checkpointing of only some layers falls between ``2.0`` and ``3.0``.
 
     ``zero_grad()`` is called automatically at the *start* of ``track_step()``.
     Call ``optimizer.step()`` **after** the block so it is excluded from the
@@ -55,7 +64,7 @@ class MFUOptimizerWrapper:
         sample_batch: dict[str, Any],
         dtype: str = "bf16",
         num_gpus: int = 1,
-        backward_factor: float = 2.0,
+        hfu_backward_factor: float = 2.0,
         device: Optional[torch.device] = None,
     ) -> None:
         self.optimizer = optimizer
@@ -63,7 +72,7 @@ class MFUOptimizerWrapper:
         self._sample_batch = sample_batch
         self._dtype = dtype
         self._num_gpus = num_gpus
-        self._backward_factor = backward_factor
+        self._hfu_backward_factor = hfu_backward_factor
         self._device = device
 
         self._spec: Optional[GPUSpec] = None
@@ -118,9 +127,10 @@ class MFUOptimizerWrapper:
                 out.loss.backward()
             wrapped.step()
 
-        FLOPs are ``fwd_flops × (1 + backward_factor)`` where ``backward_factor``
-        defaults to 2.0 (standard 3× convention). Set it higher when using
-        gradient checkpointing (typical: 3.0–4.0).
+        MFU FLOPs are fixed at ``fwd_flops × 3`` (algorithmic convention).
+        HFU FLOPs are ``fwd_hfu_flops × (1 + hfu_backward_factor)``. Default
+        ``2.0`` matches MFU (no recomputation); pass ``3.0`` for full
+        activation checkpointing.
         """
         if self._spec is None:
             self._profile_once()
@@ -140,11 +150,11 @@ class MFUOptimizerWrapper:
             result._e_start = e_start
             result._e_end = e_end
             result._total_flops = (
-                int(self._fwd_flops * (1 + self._backward_factor))
+                int(self._fwd_flops * 3)
                 if self._fwd_flops is not None else None
             )
             result._total_hfu_flops = (
-                int(self._fwd_hfu_flops * (1 + self._backward_factor))
+                int(self._fwd_hfu_flops * (1 + self._hfu_backward_factor))
                 if self._fwd_hfu_flops is not None else None
             )
             result._param_bytes = self._param_bytes
