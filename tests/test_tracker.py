@@ -94,7 +94,14 @@ def test_num_gpus_default_is_1():
 
 
 def test_mfu_above_one_possible_on_bad_spec():
-    """MFU > 1 signals our peak ceiling is wrong — not clamped, so the user sees it."""
+    """MFU > 1 is not clamped — the user sees the raw value.
+
+    Two legitimate causes:
+    1. Underestimated peak ceiling (e.g. spec sheet wrong). The signal is useful.
+    2. Long-context causal training where the kernel skips ~half of attention
+       (flash + is_causal=True), but MFU's numerator uses the unhalved
+       PaLM/Chinchilla convention. MFU can exceed 1.0 even when HFU < 1.0.
+    """
     spec = _mock_spec(peak_tflops=10.0)  # underestimated peak
     flops = int(50e12)
     mfu = compute_mfu(flops, 1.0, spec=spec)
