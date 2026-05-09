@@ -1,9 +1,15 @@
 #!/usr/bin/env python3
 """
-Benchmark MFU and MBU across batch size, attention implementation, and torch.compile.
+Benchmark MFU, HFU, and MBU across batch size, attention implementation,
+and torch.compile.
 
 Model  : GPT-2 (124M params) from HuggingFace Hub
 Device : CUDA (skips automatically without a GPU)
+
+GPT-2 uses causal SDPA, so HFU < MFU. The gap (MFU - HFU) reflects the work
+that a flash-attention kernel skips because of the causal mask. At seq_len=512
+the gap is small (attention is a minor fraction of total FLOPs); it grows as
+seq_len increases.
 
 Usage:
     .venv/bin/python examples/benchmark_mfu.py
@@ -17,7 +23,7 @@ import torch
 from transformers import GPT2Config, GPT2LMHeadModel
 
 from mfu_tracker import track
-from mfu_tracker.flops import param_bytes, profile_flops
+from mfu_tracker.flops import param_bytes, profile_flops_with_hfu
 
 # ---------------------------------------------------------------------------
 # Config
@@ -63,8 +69,8 @@ def run(
     use_compile: bool,
     steps: int,
     warmup: int,
-) -> tuple[float, float, float] | None:
-    """Returns (mean_mfu, mean_mbu, mean_step_ms), or None on OOM."""
+) -> tuple[float, float, float, float] | None:
+    """Returns (mean_mfu, mean_hfu, mean_mbu, mean_step_ms), or None on OOM."""
     try:
         model = load_model(model_id, attn_impl)
         optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
@@ -76,13 +82,14 @@ def run(
 
         # Profile before compile — FlopCounterMode needs the original graph.
         # with_backward=True uses the standard 3× convention (fwd + 2× bwd).
-        flops = profile_flops(model, kwargs=sample, with_backward=True)
+        # profile_flops_with_hfu returns both PaLM-style and causal-corrected counts.
+        profile = profile_flops_with_hfu(model, kwargs=sample, with_backward=True)
         p_bytes = param_bytes(model)
 
         if use_compile:
             model = torch.compile(model)
 
-        mfu_vals, mbu_vals, ms_vals = [], [], []
+        mfu_vals, hfu_vals, mbu_vals, ms_vals = [], [], [], []
 
         for step in range(warmup + steps):
             batch = {
@@ -91,18 +98,20 @@ def run(
             }
 
             optimizer.zero_grad()
-            with track(flops, p_bytes, dtype="fp16") as result:
+            with track(profile.flops, p_bytes, hfu_flop_count=profile.hfu_flops, dtype="fp16") as result:
                 out = model(**batch)
                 out.loss.backward()
             optimizer.step()
 
             if step >= warmup:
                 mfu_vals.append(result.mfu)
+                hfu_vals.append(result.hfu)
                 mbu_vals.append(result.mbu)
                 ms_vals.append(result.elapsed_sec * 1000)
 
         return (
             sum(mfu_vals) / len(mfu_vals),
+            sum(hfu_vals) / len(hfu_vals),
             sum(mbu_vals) / len(mbu_vals),
             sum(ms_vals) / len(ms_vals),
         )
@@ -127,17 +136,17 @@ def bar(value: float, width: int = 20) -> str:
 
 
 def print_table(rows: list[tuple]) -> None:
-    """rows: (label, mfu, mbu, ms_per_step)"""
+    """rows: (label, mfu, hfu, mbu, ms_per_step)"""
     col_label = max(len(r[0]) for r in rows) + 2
     print()
-    header = f"{'Configuration':<{col_label}}  {'MFU':>6}  {'MBU':>6}  {'ms/step':>8}  MFU"
+    header = f"{'Configuration':<{col_label}}  {'MFU':>6}  {'HFU':>6}  {'MBU':>6}  {'ms/step':>8}  MFU"
     print(header)
     print("─" * (len(header) + 22))
     baseline_mfu = rows[0][1]
-    for label, mfu, mbu, ms in rows:
+    for label, mfu, hfu, mbu, ms in rows:
         delta = f"({(mfu - baseline_mfu) * 100:+.1f}pp)" if mfu != baseline_mfu else "(baseline)"
         print(
-            f"{label:<{col_label}}  {mfu:>5.1%}  {mbu:>5.1%}  {ms:>7.1f}ms  "
+            f"{label:<{col_label}}  {mfu:>5.1%}  {hfu:>5.1%}  {mbu:>5.1%}  {ms:>7.1f}ms  "
             f"{bar(min(mfu, 1.0))} {delta}"
         )
     print()
@@ -180,9 +189,9 @@ def main() -> None:
         if result is None:
             print(" OOM — skipped")
         else:
-            mfu, mbu, ms = result
-            rows.append((label, mfu, mbu, ms))
-            print(f" done ({elapsed:.0f}s)  MFU={mfu:.1%}  MBU={mbu:.1%}")
+            mfu, hfu, mbu, ms = result
+            rows.append((label, mfu, hfu, mbu, ms))
+            print(f" done ({elapsed:.0f}s)  MFU={mfu:.1%}  HFU={hfu:.1%}  MBU={mbu:.1%}")
 
     print_table(rows)
 

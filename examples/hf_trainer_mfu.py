@@ -1,9 +1,16 @@
 #!/usr/bin/env python3
 """
-HuggingFace Trainer + MFUCallback example.
+HuggingFace Trainer + MFUCallback example (zero-config).
 
-Trains GPT-2 (124M) on synthetic data to demonstrate that MFU and MBU appear
-automatically in Trainer logs (and WandB if enabled).
+Trains GPT-2 (124M) on synthetic data to demonstrate that MFU, HFU, and MBU
+appear automatically in Trainer logs (and WandB if enabled). The callback
+auto-grabs a sample batch from train_dataloader and auto-detects
+hfu_backward_factor from TrainingArguments.gradient_checkpointing — no manual
+calibration needed.
+
+GPT-2 uses causal SDPA, so HFU is reported alongside MFU (HFU ≈ ~94% of MFU
+for seq_len=512 since attention is a small fraction of total FLOPs at this
+context length).
 
 Expected MFU on a modern GPU (RTX 4080): ~5–12% depending on batch size.
 MFU will be near-zero on CPU — a GPU is required for meaningful numbers.
@@ -11,10 +18,12 @@ MFU will be near-zero on CPU — a GPU is required for meaningful numbers.
 Usage:
     .venv/bin/python examples/hf_trainer_mfu.py
     .venv/bin/python examples/hf_trainer_mfu.py --dtype bf16 --batch-size 16
+    .venv/bin/python examples/hf_trainer_mfu.py --gradient-checkpointing
     WANDB_PROJECT=mfu-test .venv/bin/python examples/hf_trainer_mfu.py --wandb
 
-Metrics appear under "throughput/mfu" and "throughput/mbu" in WandB, grouped
-in their own section away from loss/lr. Override with --metric-prefix.
+Metrics appear under "throughput/mfu", "throughput/hfu", and "throughput/mbu"
+in WandB, grouped in their own section away from loss/lr. Override with
+--metric-prefix.
 """
 import argparse
 import sys
@@ -50,6 +59,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--steps", type=int, default=60, help="Max training steps")
     p.add_argument("--batch-size", type=int, default=8)
     p.add_argument("--logging-steps", type=int, default=20)
+    p.add_argument(
+        "--gradient-checkpointing",
+        action="store_true",
+        help="Enable activation checkpointing (HFU auto-rises to reflect recompute work)",
+    )
     p.add_argument("--wandb", action="store_true", help="Enable WandB logging")
     p.add_argument(
         "--metric-prefix",
@@ -76,15 +90,13 @@ def main() -> None:
     model = GPT2LMHeadModel(config)
 
     dataset = _SyntheticDataset(size=512)
-    # Sample batch stays on CPU; MFUCallback moves it to the model device before profiling.
-    sample_batch = {k: v[:args.batch_size] for k, v in dataset[:args.batch_size].items()}
 
-    # MFUCallback profiles forward FLOPs once at on_train_begin, then records
-    # CUDA events each step and logs throughput/mfu + throughput/mbu at every
-    # logging interval. WandB (if active) receives these alongside loss/lr with
-    # no extra configuration.
+    # Zero-config: no sample_batch needed (auto-grabbed from train_dataloader),
+    # no hfu_backward_factor needed (auto-detected from gradient_checkpointing).
+    # The callback profiles forward FLOPs once at on_train_begin, then records
+    # CUDA events each step and logs throughput/mfu, throughput/hfu (when it
+    # differs), and throughput/mbu at every logging interval.
     callback = MFUCallback(
-        sample_batch=sample_batch,
         dtype=args.dtype,
         metric_prefix=args.metric_prefix,
     )
@@ -100,6 +112,7 @@ def main() -> None:
         report_to=["wandb"] if args.wandb else ["none"],
         fp16=fp16,
         bf16=bf16,
+        gradient_checkpointing=args.gradient_checkpointing,
     )
 
     trainer = Trainer(
@@ -114,6 +127,7 @@ def main() -> None:
     print(f"Model : {sum(p.numel() for p in model.parameters()) / 1e6:.0f}M params  (GPT-2 small)")
     print(f"dtype : {args.dtype}  |  batch={args.batch_size}  seq={SEQ_LEN}")
     print(f"steps : {args.steps}  (logging every {args.logging_steps})")
+    print(f"ckpt  : {'on (HFU > MFU expected)' if args.gradient_checkpointing else 'off'}")
     if args.wandb:
         print("WandB : enabled — metrics appear under 'throughput/' section")
     else:
@@ -122,7 +136,7 @@ def main() -> None:
 
     trainer.train()
 
-    # MFU and MBU appear inline in the training progress above.
+    # MFU, HFU, and MBU appear inline in the training progress above.
     # With --wandb they are additionally sent to the "throughput/" WandB section.
 
 
