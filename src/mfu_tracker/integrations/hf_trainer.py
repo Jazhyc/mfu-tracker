@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 from transformers import TrainerCallback
 
-from ..flops import param_bytes, profile_flops
+from ..flops import param_bytes, profile_flops_with_hfu
 from ..gpu import GPUSpec, get_gpu_spec
 from ..tracker import compute_mbu, compute_mfu
 
@@ -76,6 +76,7 @@ class MFUCallback(TrainerCallback):
         self._model: Optional[nn.Module] = None
         self._spec: Optional[GPUSpec] = None
         self._fwd_flops: Optional[int] = None
+        self._fwd_hfu_flops: Optional[int] = None
         self._param_bytes: Optional[int] = None
 
         # Each entry: (e_start, e_bwd, e_end, bwd_recorded)
@@ -92,9 +93,11 @@ class MFUCallback(TrainerCallback):
                 k: v.to(model_device) if isinstance(v, torch.Tensor) else v
                 for k, v in self.sample_batch.items()
             }
-            self._fwd_flops = profile_flops(
+            profile = profile_flops_with_hfu(
                 model, kwargs=batch, with_backward=False
             )
+            self._fwd_flops = profile.flops
+            self._fwd_hfu_flops = profile.hfu_flops
         except Exception as exc:
             warnings.warn(
                 f"mfu-tracker: FLOP profiling failed ({exc}); MFU will not be logged.",
@@ -141,12 +144,18 @@ class MFUCallback(TrainerCallback):
         if elapsed_sec <= 0:
             return
 
-        total_flops = int(self._fwd_flops * n_steps * (1 + self.backward_factor))
+        step_factor = n_steps * (1 + self.backward_factor)
+        total_flops = int(self._fwd_flops * step_factor)
 
         prefix = f"{self.metric_prefix}/" if self.metric_prefix else ""
         logs[f"{prefix}mfu"] = round(
             compute_mfu(total_flops, elapsed_sec, dtype=self.dtype, num_gpus=self.num_gpus, spec=self._spec), 4
         )
+        if self._fwd_hfu_flops is not None and self._fwd_hfu_flops != self._fwd_flops:
+            total_hfu_flops = int(self._fwd_hfu_flops * step_factor)
+            logs[f"{prefix}hfu"] = round(
+                compute_mfu(total_hfu_flops, elapsed_sec, dtype=self.dtype, num_gpus=self.num_gpus, spec=self._spec), 4
+            )
         logs[f"{prefix}mbu"] = round(
             compute_mbu(self._param_bytes * n_steps, elapsed_sec, num_gpus=self.num_gpus, spec=self._spec), 4
         )

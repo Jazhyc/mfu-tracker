@@ -8,7 +8,7 @@ from typing import Any, Generator, Optional
 import torch
 import torch.nn as nn
 
-from .flops import param_bytes, profile_flops
+from .flops import param_bytes, profile_flops_with_hfu
 from .gpu import GPUSpec, get_gpu_spec
 from .tracker import UtilizationResult
 
@@ -68,6 +68,7 @@ class MFUOptimizerWrapper:
 
         self._spec: Optional[GPUSpec] = None
         self._fwd_flops: Optional[int] = None
+        self._fwd_hfu_flops: Optional[int] = None
         self._param_bytes: Optional[int] = None
 
     def profile(self) -> None:
@@ -88,11 +89,13 @@ class MFUOptimizerWrapper:
     def _profile_once(self) -> None:
         self._spec = get_gpu_spec(self._device)
         try:
-            self._fwd_flops = profile_flops(
+            profile = profile_flops_with_hfu(
                 self._model,
                 kwargs=self._sample_batch,
                 with_backward=False,
             )
+            self._fwd_flops = profile.flops
+            self._fwd_hfu_flops = profile.hfu_flops
         except Exception as exc:
             warnings.warn(
                 f"mfu-tracker: profiling failed ({exc}); MFU will not be populated.",
@@ -139,6 +142,10 @@ class MFUOptimizerWrapper:
             result._total_flops = (
                 int(self._fwd_flops * (1 + self._backward_factor))
                 if self._fwd_flops is not None else None
+            )
+            result._total_hfu_flops = (
+                int(self._fwd_hfu_flops * (1 + self._backward_factor))
+                if self._fwd_hfu_flops is not None else None
             )
             result._param_bytes = self._param_bytes
             result._device = self._device

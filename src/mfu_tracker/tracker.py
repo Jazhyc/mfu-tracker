@@ -28,6 +28,7 @@ class UtilizationResult:
 
     # Eagerly-set fields (track()) or lazily-set after _resolve() (track_step()).
     _mfu: Optional[float] = field(default=None, repr=False)
+    _hfu: Optional[float] = field(default=None, repr=False)
     _mbu: Optional[float] = field(default=None, repr=False)
     _elapsed_sec: Optional[float] = field(default=None, repr=False)
     _achieved_tflops: Optional[float] = field(default=None, repr=False)
@@ -37,6 +38,7 @@ class UtilizationResult:
     _e_start: Any = field(default=None, repr=False)
     _e_end: Any = field(default=None, repr=False)
     _total_flops: Optional[int] = field(default=None, repr=False)
+    _total_hfu_flops: Optional[int] = field(default=None, repr=False)
     _param_bytes: Optional[int] = field(default=None, repr=False)
     _device: Optional[torch.device] = field(default=None, repr=False)
 
@@ -60,6 +62,8 @@ class UtilizationResult:
         self._achieved_tflops = achieved_tflops
         self._achieved_tbs = achieved_tbs
         self._mfu = achieved_tflops / peak_tflops
+        if self._total_hfu_flops is not None:
+            self._hfu = (self._total_hfu_flops / elapsed / 1e12) / peak_tflops
         self._mbu = achieved_tbs / peak_tbs
         self._e_start = None  # mark resolved
 
@@ -71,6 +75,16 @@ class UtilizationResult:
     @mfu.setter
     def mfu(self, v: Optional[float]) -> None:
         self._mfu = v
+
+    @property
+    def hfu(self) -> Optional[float]:
+        """Hardware FLOPs Utilization — None when no causal-aware FLOP count was supplied."""
+        self._resolve()
+        return self._hfu
+
+    @hfu.setter
+    def hfu(self, v: Optional[float]) -> None:
+        self._hfu = v
 
     @property
     def mbu(self) -> Optional[float]:
@@ -114,6 +128,7 @@ def track(
     flop_count: int,
     param_bytes: int,
     *,
+    hfu_flop_count: Optional[int] = None,
     dtype: str = "fp16",
     num_gpus: int = 1,
     device: Optional[torch.device] = None,
@@ -125,6 +140,10 @@ def track(
     Args:
         flop_count:  Total FLOPs for the block (use flops.profile_flops or your own).
         param_bytes: Bytes transferred for weights (num_params * bytes_per_element).
+        hfu_flop_count: Optional second FLOP count using the HFU convention
+                     (causal SDPA halved). When supplied, ``result.hfu`` is
+                     populated alongside ``result.mfu``. Get this from
+                     ``profile_flops_with_hfu(...).hfu_flops``.
         dtype:       Compute dtype string — "fp16", "bf16", "int8", "fp8", "int4", "fp4".
         num_gpus:    Multiplier applied to the peak ceiling (default 1). When using
                      ``profile_flops`` as the source of *flop_count*, leave this at 1
@@ -170,9 +189,12 @@ def track(
     elapsed = time.perf_counter() - t0
 
     result.elapsed_sec = elapsed
-    result.achieved_tflops = flop_count / elapsed / 1e12
+    achieved_tflops = flop_count / elapsed / 1e12
+    result.achieved_tflops = achieved_tflops
     result.achieved_tbs = param_bytes / elapsed / 1e12
-    result.mfu = result.achieved_tflops / peak_tflops
+    result.mfu = achieved_tflops / peak_tflops
+    if hfu_flop_count is not None:
+        result.hfu = (hfu_flop_count / elapsed / 1e12) / peak_tflops
     result.mbu = result.achieved_tbs / peak_tbs
 
 

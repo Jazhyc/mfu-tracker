@@ -1,10 +1,31 @@
 """FLOP counting via FlopCounterMode (PyTorch 2.1+)."""
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any, Optional
 
 import torch
 import torch.nn as nn
+
+
+@dataclass(frozen=True)
+class FlopProfile:
+    """
+    Two FLOP counts for one model step.
+
+    ``flops`` is the unmasked matmul count reported by PyTorch's
+    ``FlopCounterMode``. This is the convention used by the PaLM paper, the
+    Chinchilla scaling laws, and most published MFU numbers.
+
+    ``hfu_flops`` halves the SDPA contribution when ``is_causal=True`` to
+    reflect what a causal flash-attention kernel actually executes (it skips
+    the upper triangle of the attention matrix). Use this for Hardware FLOPs
+    Utilization (HFU). For non-causal models ``hfu_flops == flops``.
+
+    The two numbers come from a single trace.
+    """
+    flops: int
+    hfu_flops: int
 
 
 def flash_attn_flops(
@@ -34,22 +55,79 @@ def flash_attn_flops(
     return fwd_flops * 3 if with_backward else fwd_flops
 
 
-def _profile_with_flop_counter(target: nn.Module, call_args: tuple) -> int:
+# Position of `is_causal` in each SDPA ATen op's positional args (0-indexed,
+# excluding `out_shape` which the registry passes as a kwarg). Matches the
+# schemas at:
+#   aten._scaled_dot_product_flash_attention(q, k, v, dropout_p, is_causal, ...)
+#   aten._scaled_dot_product_efficient_attention(q, k, v, attn_bias, compute_log_sumexp, dropout_p, is_causal, ...)
+#   aten._scaled_dot_product_cudnn_attention(q, k, v, attn_bias, compute_log_sumexp, dropout_p, is_causal, ...)
+_IS_CAUSAL_INDEX = {
+    "_scaled_dot_product_flash_attention": 4,
+    "_scaled_dot_product_efficient_attention": 6,
+    "_scaled_dot_product_cudnn_attention": 6,
+}
+
+
+def _build_causal_aware_mapping(causal_savings_box: list[int]) -> dict[Any, Any]:
+    """
+    Custom flop-formula mapping that mirrors PyTorch's default sdpa_flop counts
+    while accumulating the *causal savings* (= half the SDPA FLOPs when
+    is_causal=True) into ``causal_savings_box[0]`` as a side channel.
+
+    The reported total stays equal to the unhalved (PaLM/MFU) convention; HFU
+    is recovered as ``total - causal_savings``.
+    """
+    from torch.utils.flop_counter import sdpa_flop_count
+
+    aten = torch.ops.aten
+
+    def _make_formula(is_causal_idx: int):
+        def formula(query, key, value, *args, out_shape=None, **kwargs):
+            full = sdpa_flop_count(query.shape, key.shape, value.shape)
+            # is_causal lives among `args` — adjust for the q/k/v stripped above.
+            extra_idx = is_causal_idx - 3
+            is_causal = bool(args[extra_idx]) if extra_idx < len(args) else False
+            if is_causal:
+                causal_savings_box[0] += full // 2
+            return full
+        formula._get_raw = True  # type: ignore[attr-defined]
+        return formula
+
+    return {
+        aten._scaled_dot_product_flash_attention: _make_formula(
+            _IS_CAUSAL_INDEX["_scaled_dot_product_flash_attention"]
+        ),
+        aten._scaled_dot_product_efficient_attention: _make_formula(
+            _IS_CAUSAL_INDEX["_scaled_dot_product_efficient_attention"]
+        ),
+        aten._scaled_dot_product_cudnn_attention: _make_formula(
+            _IS_CAUSAL_INDEX["_scaled_dot_product_cudnn_attention"]
+        ),
+    }
+
+
+def _profile_with_flop_counter(target: nn.Module, call_args: tuple) -> tuple[int, int]:
     """Profile using torch.utils.flop_counter.FlopCounterMode.
 
-    Works at the ATen dispatch level — counts F.scaled_dot_product_attention
-    (SDPA / native flash attention) on CUDA automatically. Returns -1 on failure.
+    Returns ``(forward_flops, causal_savings)`` — both non-negative, or ``(-1, 0)``
+    on failure. ``causal_savings`` is the FLOP count that a causal flash-attention
+    kernel skips relative to the unmasked matmul; subtract from ``forward_flops``
+    for HFU.
     """
     from torch.utils.flop_counter import FlopCounterMode
+
+    causal_savings_box = [0]
+    custom_mapping = _build_causal_aware_mapping(causal_savings_box)
 
     was_training = target.training
     target.eval()
     try:
-        with torch.no_grad(), FlopCounterMode(display=False) as flop_counter:
+        fc = FlopCounterMode(display=False, custom_mapping=custom_mapping)
+        with torch.no_grad(), fc:
             target(*call_args)
-        return int(flop_counter.get_total_flops())
+        return int(fc.get_total_flops()), causal_savings_box[0]
     except Exception:
-        return -1
+        return -1, 0
     finally:
         target.train(was_training)
 
@@ -122,7 +200,7 @@ def profile_flops(
         target = model
         call_args = args if args is not None else ()
 
-    forward_flops = _profile_with_flop_counter(target, call_args)
+    forward_flops, _ = _profile_with_flop_counter(target, call_args)
     if forward_flops < 0:
         raise RuntimeError(
             "FlopCounterMode failed to trace this model. "
@@ -131,6 +209,65 @@ def profile_flops(
         )
 
     return forward_flops * 3 if with_backward else forward_flops
+
+
+def profile_flops_with_hfu(
+    model: nn.Module,
+    args: Optional[tuple] = None,
+    kwargs: Optional[dict[str, Any]] = None,
+    *,
+    with_backward: bool = True,
+) -> FlopProfile:
+    """
+    Like :func:`profile_flops` but returns both MFU- and HFU-style FLOP counts.
+
+    ``FlopProfile.flops`` is the unmasked matmul total (PaLM convention, what
+    most published MFU numbers use). ``FlopProfile.hfu_flops`` halves SDPA
+    contributions for which ``is_causal=True`` — closer to what a causal
+    flash-attention kernel actually executes.
+
+    Both numbers come from one trace, so the cost is identical to
+    :func:`profile_flops`. For non-causal models the two values are equal.
+
+    Limitations of the HFU correction:
+        * Only ``is_causal=True`` on `F.scaled_dot_product_attention` is
+          detected. Models passing an explicit causal ``attn_mask`` instead of
+          the flag are counted as non-causal.
+        * Sliding-window / local-attention masks (e.g. Mistral, Gemma)
+          actually skip more than half the matrix — halving understates the
+          savings.
+        * The math SDPA backend computes the full matrix even with
+          ``is_causal=True``, so ``hfu_flops`` overstates the savings on CPU
+          or when flash/efficient backends are unavailable.
+        * Direct ``flash_attn_func`` calls bypass the ATen dispatch entirely;
+          use :func:`flash_attn_flops` with ``causal=True`` to add the
+          correction manually.
+    """
+    if kwargs:
+        _kw = kwargs
+
+        class _KwargsAdapter(nn.Module):
+            def forward(self):
+                return model(**(args[0] if args and isinstance(args[0], dict) else _kw))
+
+        target: nn.Module = _KwargsAdapter()
+        call_args: tuple = ()
+    else:
+        target = model
+        call_args = args if args is not None else ()
+
+    forward_flops, causal_savings = _profile_with_flop_counter(target, call_args)
+    if forward_flops < 0:
+        raise RuntimeError(
+            "FlopCounterMode failed to trace this model. "
+            "Compute FLOPs analytically (e.g. 6 × params × tokens) and pass them "
+            "directly to compute_mfu()/track() instead of using profile_flops()."
+        )
+
+    forward_hfu = forward_flops - causal_savings
+    if with_backward:
+        return FlopProfile(flops=forward_flops * 3, hfu_flops=forward_hfu * 3)
+    return FlopProfile(flops=forward_flops, hfu_flops=forward_hfu)
 
 
 def param_bytes(model: nn.Module, *, trainable_only: bool = False) -> int:

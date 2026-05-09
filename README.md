@@ -131,6 +131,23 @@ p_bytes = param_bytes(model, trainable_only=True)
 
 `with_backward=True` applies the standard 3× convention (1× forward + 2× backward). For gradient checkpointing, pass `backward_factor=3.0` or `4.0` to `MFUOptimizerWrapper` or `MFUCallback`.
 
+### MFU vs HFU
+
+`profile_flops` and the published-MFU convention count the unmasked matmul work for `F.scaled_dot_product_attention`, regardless of `is_causal`. Hardware FLOPs Utilization (HFU) instead halves causal SDPA contributions to reflect what a flash-attention kernel actually executes (it skips the upper triangle). The `MFUOptimizerWrapper` and `MFUCallback` populate both metrics automatically when the model uses `is_causal=True`.
+
+For bare `track()`, opt in by supplying both counts:
+
+```python
+from mfu_tracker import profile_flops_with_hfu, track
+
+profile = profile_flops_with_hfu(model, kwargs=batch, with_backward=True)
+with track(profile.flops, p_bytes, hfu_flop_count=profile.hfu_flops, dtype="bf16") as r:
+    ...
+print(f"MFU={r.mfu:.3f}  HFU={r.hfu:.3f}")
+```
+
+`HFU < MFU` only when the model uses `is_causal=True` on SDPA; for bidirectional models the two are equal. The HF callback adds `throughput/hfu` alongside `throughput/mfu` only when the values differ.
+
 ---
 
 ## GPU spec
@@ -177,7 +194,7 @@ Leave `num_gpus=1` (the default) when using `profile_flops` as the FLOP source. 
 ## Limitations
 
 - **SDPA on CPU is not counted** — `FlopCounterMode` does not intercept flash attention dispatch on CPU. Profile with a CUDA model.
-- **Causal attention is counted unmasked** — `FlopCounterMode` reports the raw matmul FLOPs for `F.scaled_dot_product_attention` regardless of `is_causal`. A flash-attention kernel with causal masking actually executes ~half those FLOPs (it skips the upper triangle). This matches the convention used in PaLM, Chinchilla, and most published MFU numbers, so comparisons to the literature are apples-to-apples; it does *not* match Hardware FLOPs Utilization (HFU). The discrepancy is small at short context (attention is a minor fraction of total FLOPs) but grows at long context where attention dominates — for an 8k+ context model, MFU can be inflated by 20–40% relative to HFU.
+- **MFU counts causal attention unmasked** — `profile_flops` and `compute_mfu` follow the PaLM/Chinchilla convention and report the raw matmul FLOPs for `F.scaled_dot_product_attention` regardless of `is_causal`. A causal flash-attention kernel actually executes ~half those FLOPs. The library reports HFU separately (see "MFU vs HFU" above) for the kernel-aware view. HFU detection only fires for `is_causal=True`; explicit causal masks via `attn_mask=`, sliding-window attention, and direct `flash_attn_func` calls are not auto-detected.
 - **bitsandbytes quantized layers** — INT8/NF4 kernels are opaque to `FlopCounterMode`. NF4 dequantizes to fp16 before the matmul, so FLOP counts are approximately correct. Pass the appropriate dtype to use the right peak ceiling.
 - **`flash_attn_func` direct calls** — models bypassing `F.scaled_dot_product_attention` need a manual `flash_attn_flops()` correction (see above).
 - **Peak ceilings from spec sheets** — these are not independently measured. MFU > 1.0 indicates the ceiling is underestimated.

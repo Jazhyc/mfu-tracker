@@ -5,9 +5,11 @@ import torch.nn as nn
 from unittest.mock import patch
 
 from mfu_tracker.flops import (
+    FlopProfile,
     flash_attn_flops,
     param_bytes,
     profile_flops,
+    profile_flops_with_hfu,
     _profile_with_flop_counter,
 )
 
@@ -46,8 +48,9 @@ def test_profile_flops_linear_matches_theory():
     M, K, N = 4, 64, 128
     model = nn.Linear(K, N, bias=False)
     sample = torch.randn(M, K)
-    flops = _profile_with_flop_counter(model, (sample,))
+    flops, savings = _profile_with_flop_counter(model, (sample,))
     assert flops == 2 * M * N * K
+    assert savings == 0  # No SDPA → no causal savings
 
 
 def test_profile_flops_raises_when_counter_fails():
@@ -55,9 +58,33 @@ def test_profile_flops_raises_when_counter_fails():
     model = _TinyMLP()
     sample = torch.randn(1, 64)
 
-    with patch("mfu_tracker.flops._profile_with_flop_counter", return_value=-1):
+    with patch("mfu_tracker.flops._profile_with_flop_counter", return_value=(-1, 0)):
         with pytest.raises(RuntimeError, match="FlopCounterMode failed"):
             profile_flops(model, args=(sample,), with_backward=False)
+
+
+# ---------------------------------------------------------------------------
+# profile_flops_with_hfu — HFU equals MFU when no causal SDPA is used
+# ---------------------------------------------------------------------------
+
+def test_profile_flops_with_hfu_no_sdpa():
+    """For models without SDPA, hfu_flops should equal flops."""
+    model = _TinyMLP()
+    sample = torch.randn(1, 64)
+    profile = profile_flops_with_hfu(model, args=(sample,), with_backward=False)
+    assert isinstance(profile, FlopProfile)
+    assert profile.flops > 0
+    assert profile.hfu_flops == profile.flops
+
+
+def test_profile_flops_with_hfu_backward_3x():
+    """Backward multiplier applies equally to both flop counts."""
+    model = _TinyMLP()
+    sample = torch.randn(1, 64)
+    fwd = profile_flops_with_hfu(model, args=(sample,), with_backward=False)
+    total = profile_flops_with_hfu(model, args=(sample,), with_backward=True)
+    assert total.flops == fwd.flops * 3
+    assert total.hfu_flops == fwd.hfu_flops * 3
 
 
 # ---------------------------------------------------------------------------
@@ -121,7 +148,7 @@ def test_flop_counter_counts_sdpa_on_cuda():
             return F.scaled_dot_product_attention(q, k, v, is_causal=True)
 
     model = _SDPAModule().cuda()
-    fc_flops = _profile_with_flop_counter(model, (q, k, v))
+    fc_flops, causal_savings = _profile_with_flop_counter(model, (q, k, v))
 
     # SDPA forward = two matmuls (Q@Kᵀ and attn@V) at 2*B*S²*H*D each.
     # FlopCounterMode reports raw matmul FLOPs without applying the causal mask discount.
@@ -130,3 +157,32 @@ def test_flop_counter_counts_sdpa_on_cuda():
     assert abs(fc_flops - expected) / expected < 0.05, (
         f"FlopCounterMode ({fc_flops}) deviates >5% from analytical estimate ({expected})"
     )
+    # is_causal=True → half the FLOPs are accounted as causal savings.
+    assert causal_savings == fc_flops // 2
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for SDPA dispatch")
+def test_hfu_halves_causal_sdpa_only():
+    """profile_flops_with_hfu halves causal SDPA but not non-causal SDPA."""
+    import torch.nn.functional as F
+
+    B, H, S, D = 2, 4, 128, 32
+    q = torch.randn(B, H, S, D, device="cuda", dtype=torch.float16)
+    k, v = torch.randn_like(q), torch.randn_like(q)
+
+    class _CausalSDPA(nn.Module):
+        def forward(self, q, k, v):
+            return F.scaled_dot_product_attention(q, k, v, is_causal=True)
+
+    class _NonCausalSDPA(nn.Module):
+        def forward(self, q, k, v):
+            return F.scaled_dot_product_attention(q, k, v, is_causal=False)
+
+    causal = profile_flops_with_hfu(_CausalSDPA().cuda(), args=(q, k, v), with_backward=False)
+    non_causal = profile_flops_with_hfu(_NonCausalSDPA().cuda(), args=(q, k, v), with_backward=False)
+
+    # Same total FLOPs (PaLM convention) regardless of mask.
+    assert causal.flops == non_causal.flops
+    # HFU halves causal; non-causal is unchanged.
+    assert causal.hfu_flops == causal.flops // 2
+    assert non_causal.hfu_flops == non_causal.flops
