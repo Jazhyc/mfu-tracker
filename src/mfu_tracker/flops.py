@@ -93,7 +93,7 @@ def _build_causal_aware_mapping(causal_savings_box: list[int]) -> dict[Any, Any]
         formula._get_raw = True  # type: ignore[attr-defined]
         return formula
 
-    return {
+    mapping: dict[Any, Any] = {
         aten._scaled_dot_product_flash_attention: _make_formula(
             _IS_CAUSAL_INDEX["_scaled_dot_product_flash_attention"]
         ),
@@ -104,6 +104,36 @@ def _build_causal_aware_mapping(causal_savings_box: list[int]) -> dict[Any, Any]
             _IS_CAUSAL_INDEX["_scaled_dot_product_cudnn_attention"]
         ),
     }
+
+    # Tri Dao's flash_attn package (PyPI) registers its kernels via
+    # `torch.library.custom_op` under the `flash_attn::` namespace since 2.5.
+    # When importable, those ops appear in the dispatcher and we can register
+    # an exact (not estimated) flop formula for them. Schema:
+    #   flash_attn::_flash_attn_forward(q, k, v, dropout_p, softmax_scale,
+    #       causal, window_size_left, window_size_right, softcap, alibi_slopes,
+    #       return_softmax) -> (...)
+    # Layout is (B, S, H, D) — different from SDPA's (B, H, S, D).
+    flash_attn_ops = getattr(torch.ops, "flash_attn", None)
+    if flash_attn_ops is not None:
+        def _flash_attn_formula(query, key, value, *args, out_shape=None, **kwargs):
+            B, S, H, D = query.shape
+            full = 4 * B * H * S * S * D  # Q@Kᵀ + attn@V, both 2·B·H·S²·D
+            # `causal` is at args[2] after q/k/v stripped (positional idx 5 in schema).
+            is_causal = bool(args[2]) if len(args) > 2 else False
+            if is_causal:
+                causal_savings_box[0] += full // 2
+            return full
+        _flash_attn_formula._get_raw = True  # type: ignore[attr-defined]
+
+        op = getattr(flash_attn_ops, "_flash_attn_forward", None)
+        if op is not None:
+            mapping[op] = _flash_attn_formula
+        # Varlen forward (`_flash_attn_varlen_forward`) packs sequences and has
+        # a different schema (causal at positional 9, q layout (total_tokens,
+        # H, D), per-sequence lengths in cu_seqlens). Not registered — HF's
+        # `attn_implementation="flash_attention_2"` calls the regular forward.
+
+    return mapping
 
 
 def _profile_with_flop_counter(target: nn.Module, call_args: tuple) -> tuple[int, int]:

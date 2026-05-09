@@ -118,9 +118,11 @@ from mfu_tracker import profile_flops, flash_attn_flops, param_bytes
 # Standard models — FlopCounterMode counts SDPA automatically on CUDA
 flops = profile_flops(model, kwargs=batch, with_backward=True)
 
-# Models calling flash_attn_func directly (rare; older HF with use_flash_attention_2=True)
-# need a manual correction since the C extension is opaque to FlopCounterMode:
-flops += flash_attn_flops(batch_size=B, seq_len=S, num_heads=H, head_dim=D)
+# flash_attn 2.5+ (Tri Dao's standalone PyPI package) is also counted
+# automatically — it registers its kernels via torch.library.custom_op,
+# so FlopCounterMode sees them. The manual flash_attn_flops() helper is only
+# needed for older flash_attn versions (≤2.4) that bypass the dispatcher:
+# flops += flash_attn_flops(batch_size=B, seq_len=S, num_heads=H, head_dim=D)
 
 # PEFT / LoRA — restrict param_bytes to trainable parameters only
 p_bytes = param_bytes(model, trainable_only=True)

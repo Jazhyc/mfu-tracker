@@ -161,6 +161,26 @@ def test_flop_counter_counts_sdpa_on_cuda():
     assert causal_savings == fc_flops // 2
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for flash_attn")
+def test_flash_attn_func_counted_automatically():
+    """Tri Dao's flash_attn_func should be counted exactly when the package is importable."""
+    flash_attn = pytest.importorskip("flash_attn")
+    flash_attn_func = flash_attn.flash_attn_func
+
+    B, H, S, D = 2, 8, 256, 64
+    q = torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16)
+    k, v = torch.randn_like(q), torch.randn_like(q)
+
+    class _FAMod(nn.Module):
+        def forward(self, q, k, v):
+            return flash_attn_func(q, k, v, causal=True)
+
+    profile = profile_flops_with_hfu(_FAMod().cuda(), args=(q, k, v), with_backward=False)
+    expected_mfu = 4 * B * H * S * S * D
+    assert profile.flops == expected_mfu
+    assert profile.hfu_flops == expected_mfu // 2  # causal halves
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for SDPA dispatch")
 def test_hfu_halves_causal_sdpa_only():
     """profile_flops_with_hfu halves causal SDPA but not non-causal SDPA."""
