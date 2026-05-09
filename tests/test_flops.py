@@ -9,7 +9,6 @@ from mfu_tracker.flops import (
     param_bytes,
     profile_flops,
     _profile_with_flop_counter,
-    _profile_with_thop,
 )
 
 
@@ -42,25 +41,23 @@ def test_profile_flops_with_backward_3x():
     assert total == fwd * 3
 
 
-def test_profile_flops_flop_counter_and_thop_agree():
-    """FlopCounterMode and thop should return the same count for plain linear ops."""
-    model = _TinyMLP()
-    sample = torch.randn(1, 64)
-    fc_flops = _profile_with_flop_counter(model, (sample,))
-    thop_flops = _profile_with_thop(model, (sample,))
-    # Should be identical for ops both tools understand
-    assert fc_flops == thop_flops
+def test_profile_flops_linear_matches_theory():
+    """For nn.Linear(K, N) with input (M, K): FLOPs = 2 * M * N * K (+ bias add)."""
+    M, K, N = 4, 64, 128
+    model = nn.Linear(K, N, bias=False)
+    sample = torch.randn(M, K)
+    flops = _profile_with_flop_counter(model, (sample,))
+    assert flops == 2 * M * N * K
 
 
-def test_profile_flops_falls_back_to_thop_on_failure():
-    """If FlopCounterMode returns -1, thop fallback is used."""
+def test_profile_flops_raises_when_counter_fails():
+    """If FlopCounterMode returns -1, profile_flops raises with a helpful message."""
     model = _TinyMLP()
     sample = torch.randn(1, 64)
 
     with patch("mfu_tracker.flops._profile_with_flop_counter", return_value=-1):
-        flops = profile_flops(model, args=(sample,), with_backward=False)
-
-    assert flops == _profile_with_thop(model, (sample,))
+        with pytest.raises(RuntimeError, match="FlopCounterMode failed"):
+            profile_flops(model, args=(sample,), with_backward=False)
 
 
 # ---------------------------------------------------------------------------
@@ -112,7 +109,7 @@ def test_flash_attn_flops_with_backward_3x():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for SDPA dispatch")
 def test_flop_counter_counts_sdpa_on_cuda():
-    """FlopCounterMode must count SDPA FLOPs on CUDA (thop returns 0 for them)."""
+    """FlopCounterMode must count SDPA FLOPs on CUDA."""
     import torch.nn.functional as F
 
     B, H, S, D = 2, 4, 128, 32
@@ -125,11 +122,11 @@ def test_flop_counter_counts_sdpa_on_cuda():
 
     model = _SDPAModule().cuda()
     fc_flops = _profile_with_flop_counter(model, (q, k, v))
-    thop_flops = _profile_with_thop(model, (q, k, v))
 
-    # FlopCounterMode should count SDPA; thop should miss it
+    # SDPA forward = two matmuls (Q@Kᵀ and attn@V) at 2*B*S²*H*D each.
+    # FlopCounterMode reports raw matmul FLOPs without applying the causal mask discount.
+    expected = 4 * B * S * S * H * D
     assert fc_flops > 0, "FlopCounterMode returned 0 for SDPA on CUDA"
-    assert fc_flops > thop_flops, (
-        f"FlopCounterMode ({fc_flops}) should exceed thop ({thop_flops}) "
-        "since thop misses the fused SDPA kernel"
+    assert abs(fc_flops - expected) / expected < 0.05, (
+        f"FlopCounterMode ({fc_flops}) deviates >5% from analytical estimate ({expected})"
     )

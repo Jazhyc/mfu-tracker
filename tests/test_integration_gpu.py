@@ -58,7 +58,7 @@ def test_ada_fp8_supported():
 
 
 # ---------------------------------------------------------------------------
-# FLOP counting accuracy (thop against analytical ground truth)
+# FLOP counting accuracy (FlopCounterMode against analytical ground truth)
 # ---------------------------------------------------------------------------
 
 def test_linear_flop_count_matches_theory():
@@ -75,7 +75,7 @@ def test_linear_flop_count_matches_theory():
 
     rel_error = abs(flops - expected) / expected
     assert rel_error < 0.01, (
-        f"thop FLOP count {flops:,} differs from theory {expected:,} "
+        f"FLOP count {flops:,} differs from theory {expected:,} "
         f"by {rel_error:.1%}"
     )
 
@@ -97,7 +97,7 @@ def test_conv2d_flop_count_matches_theory():
 
     rel_error = abs(flops - expected) / expected
     assert rel_error < 0.01, (
-        f"thop FLOP count {flops:,} differs from theory {expected:,} "
+        f"FLOP count {flops:,} differs from theory {expected:,} "
         f"by {rel_error:.1%}"
     )
 

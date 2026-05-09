@@ -1,4 +1,4 @@
-"""FLOP counting — FlopCounterMode (PyTorch 2.1+) with thop fallback."""
+"""FLOP counting via FlopCounterMode (PyTorch 2.1+)."""
 from __future__ import annotations
 
 from typing import Any, Optional
@@ -35,15 +35,12 @@ def flash_attn_flops(
 
 
 def _profile_with_flop_counter(target: nn.Module, call_args: tuple) -> int:
-    """Profile using torch.utils.flop_counter.FlopCounterMode (PyTorch 2.1+).
+    """Profile using torch.utils.flop_counter.FlopCounterMode.
 
     Works at the ATen dispatch level — counts F.scaled_dot_product_attention
     (SDPA / native flash attention) on CUDA automatically. Returns -1 on failure.
     """
-    try:
-        from torch.utils.flop_counter import FlopCounterMode
-    except ImportError:
-        return -1
+    from torch.utils.flop_counter import FlopCounterMode
 
     was_training = target.training
     target.eval()
@@ -55,15 +52,6 @@ def _profile_with_flop_counter(target: nn.Module, call_args: tuple) -> int:
         return -1
     finally:
         target.train(was_training)
-
-
-def _profile_with_thop(target: nn.Module, call_args: tuple) -> int:
-    """Profile using thop — fallback for PyTorch < 2.1 or unsupported models."""
-    from thop import profile
-
-    result = profile(target, inputs=call_args, verbose=False)
-    macs = result[0]
-    return int(macs * 2)
 
 
 def profile_flops(
@@ -80,7 +68,6 @@ def profile_flops(
     hooks at the ATen operator level and automatically counts
     ``F.scaled_dot_product_attention`` (SDPA) on CUDA — covering virtually all
     modern transformer attention implementations without any manual correction.
-    Falls back to ``thop`` on older PyTorch versions.
 
     **Quantized models (bitsandbytes INT8 / NF4):**
     Both counters operate on the Python/ATen graph and cannot see inside opaque
@@ -137,7 +124,11 @@ def profile_flops(
 
     forward_flops = _profile_with_flop_counter(target, call_args)
     if forward_flops < 0:
-        forward_flops = _profile_with_thop(target, call_args)
+        raise RuntimeError(
+            "FlopCounterMode failed to trace this model. "
+            "Compute FLOPs analytically (e.g. 6 × params × tokens) and pass them "
+            "directly to compute_mfu()/track() instead of using profile_flops()."
+        )
 
     return forward_flops * 3 if with_backward else forward_flops
 

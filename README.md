@@ -4,7 +4,7 @@ When profiling training runs, I found that most existing tools either lacked MFU
 
 **mfu-tracker** is a PyTorch library for measuring Model FLOPs Utilization (MFU) and Model Bandwidth Utilization (MBU). It supports bare PyTorch training loops, an optimizer wrapper, and a HuggingFace Trainer callback.
 
-- **Minimal dependencies** — PyTorch and `thop` only.
+- **Minimal dependencies** — PyTorch only.
 - **Profiled FLOPs, not formula estimates** — uses `FlopCounterMode` to count the FLOPs your model actually executes rather than a formula like `6 × params × tokens`. For Mixture-of-Experts models this means only active experts are counted, giving a more accurate numerator than parameter-based estimates.
 - **Three integration styles** — context manager, optimizer wrapper, HF Trainer callback.
 - **WandB / TensorBoard / MLflow** — metrics are logged through HF Trainer's existing pipeline when using `MFUCallback`.
@@ -177,6 +177,7 @@ Leave `num_gpus=1` (the default) when using `profile_flops` as the FLOP source. 
 ## Limitations
 
 - **SDPA on CPU is not counted** — `FlopCounterMode` does not intercept flash attention dispatch on CPU. Profile with a CUDA model.
+- **Causal attention is counted unmasked** — `FlopCounterMode` reports the raw matmul FLOPs for `F.scaled_dot_product_attention` regardless of `is_causal`. A flash-attention kernel with causal masking actually executes ~half those FLOPs (it skips the upper triangle). This matches the convention used in PaLM, Chinchilla, and most published MFU numbers, so comparisons to the literature are apples-to-apples; it does *not* match Hardware FLOPs Utilization (HFU). The discrepancy is small at short context (attention is a minor fraction of total FLOPs) but grows at long context where attention dominates — for an 8k+ context model, MFU can be inflated by 20–40% relative to HFU.
 - **bitsandbytes quantized layers** — INT8/NF4 kernels are opaque to `FlopCounterMode`. NF4 dequantizes to fp16 before the matmul, so FLOP counts are approximately correct. Pass the appropriate dtype to use the right peak ceiling.
 - **`flash_attn_func` direct calls** — models bypassing `F.scaled_dot_product_attention` need a manual `flash_attn_flops()` correction (see above).
 - **Peak ceilings from spec sheets** — these are not independently measured. MFU > 1.0 indicates the ceiling is underestimated.
@@ -188,7 +189,7 @@ Leave `num_gpus=1` (the default) when using `profile_flops` as the FLOP source. 
 ## Requirements
 
 - Python 3.9+
-- PyTorch 2.0+ (2.1+ recommended for `FlopCounterMode`)
+- PyTorch 2.1+ (for `FlopCounterMode`)
 - A CUDA GPU is required for meaningful results; CPU timing works but MFU will be near zero for any realistic model
 
 ---
