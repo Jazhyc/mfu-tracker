@@ -178,6 +178,41 @@ def test_step_begin_end_accumulates_pending():
     assert not hasattr(cb, "_pending_step")
 
 
+def test_pre_optimizer_step_ends_timing_window():
+    """Timing should end at on_pre_optimizer_step, not on_step_end."""
+    cb = _make_callback()
+    cb._fwd_flops = 1_000_000
+    cb._spec = MagicMock()
+    cb._param_bytes = 50_000
+
+    e_start, e_end = MagicMock(), MagicMock()
+    with patch("torch.cuda.Event", side_effect=[e_start, e_end]):
+        cb.on_step_begin(_dummy_args(), _dummy_state(), _dummy_control())
+        cb.on_pre_optimizer_step(_dummy_args(), _dummy_state(), _dummy_control())
+        # on_step_end fires too but should be a no-op since timing already ended
+        cb.on_step_end(_dummy_args(), _dummy_state(), _dummy_control())
+
+    e_end.record.assert_called_once()  # only recorded once, by on_pre_optimizer_step
+    assert len(cb._pending) == 1
+
+
+def test_on_step_end_fallback_when_no_pre_optimizer_step():
+    """If on_pre_optimizer_step never fires (older HF), on_step_end ends timing."""
+    cb = _make_callback()
+    cb._fwd_flops = 1_000_000
+    cb._spec = MagicMock()
+    cb._param_bytes = 50_000
+
+    e_start, e_end = MagicMock(), MagicMock()
+    with patch("torch.cuda.Event", side_effect=[e_start, e_end]):
+        cb.on_step_begin(_dummy_args(), _dummy_state(), _dummy_control())
+        # No on_pre_optimizer_step call — simulate older HF
+        cb.on_step_end(_dummy_args(), _dummy_state(), _dummy_control())
+
+    e_end.record.assert_called_once()
+    assert len(cb._pending) == 1
+
+
 def test_on_log_computes_mfu_mbu():
     cb = _make_callback()
     cb._fwd_flops = 1_000_000

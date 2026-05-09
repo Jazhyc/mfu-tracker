@@ -30,6 +30,11 @@ class MFUCallback(TrainerCallback):
     GPU stall). The single ``torch.cuda.synchronize()`` is deferred to ``on_log``
     and amortised across all steps in the logging interval.
 
+    The timing window ends at ``on_pre_optimizer_step`` (with ``on_step_end``
+    as a fallback), so ``optimizer.step()`` is excluded — its fp32 elementwise
+    work would otherwise inflate elapsed time without contributing to the
+    bf16/fp16 FLOP numerator, underestimating MFU by 2–5%.
+
     Usage::
 
         from mfu_tracker.integrations.hf_trainer import MFUCallback
@@ -158,11 +163,24 @@ class MFUCallback(TrainerCallback):
         e_start.record()
         self._pending_step = (e_start, e_end)
 
-    def on_step_end(self, args, state, control, **kwargs):
-        if not hasattr(self, "_pending_step"):
-            return
+    def on_pre_optimizer_step(self, args, state, control, **kwargs):
+        # End the timing window *before* optimizer.step() so its (typically
+        # fp32) elementwise work doesn't inflate elapsed time. The forward +
+        # backward FLOPs in our numerator are bf16/fp16 — including the fp32
+        # optimizer in the denominator would underestimate MFU by 2–5%.
+        self._end_timing()
 
-        e_start, e_end = self._pending_step
+    def on_step_end(self, args, state, control, **kwargs):
+        # Fallback: record end here if on_pre_optimizer_step never fired
+        # (older HF versions, custom training loops). The window then includes
+        # optimizer.step and slightly underestimates MFU — not catastrophic.
+        self._end_timing()
+
+    def _end_timing(self) -> None:
+        pending = getattr(self, "_pending_step", None)
+        if pending is None:
+            return  # already recorded this step (on_pre_optimizer_step ran)
+        e_start, e_end = pending
         e_end.record()
         self._pending.append((e_start, e_end))
         del self._pending_step
