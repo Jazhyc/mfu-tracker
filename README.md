@@ -41,25 +41,26 @@ HuggingFace Trainer integration requires no extra install — if you are already
 
 ## Usage
 
-### Context manager (bare PyTorch)
+### HuggingFace Trainer
 
 ```python
-from mfu_tracker import track, profile_flops, param_bytes
+from mfu_tracker.integrations.hf_trainer import MFUCallback
 
-# Profile once on the uncompiled model before training begins
-sample = {"input_ids": batch["input_ids"][:1]}
-flops = profile_flops(model, kwargs=sample, with_backward=True)
-p_bytes = param_bytes(model)
-
-for batch in dataloader:
-    optimizer.zero_grad()
-    with track(flops, p_bytes, dtype="bf16") as result:
-        loss = model(**batch).loss
-        loss.backward()
-    optimizer.step()
-
-    print(f"MFU: {result.mfu:.3f}  MBU: {result.mbu:.3f}  {result.elapsed_sec*1000:.0f} ms/step")
+# Zero-config: the callback grabs a sample batch from train_dataloader at
+# on_train_begin, and auto-detects hfu_backward_factor from
+# TrainingArguments.gradient_checkpointing.
+trainer = Trainer(
+    model=model,
+    args=training_args,
+    train_dataset=train_dataset,
+    callbacks=[MFUCallback(dtype="bf16", metric_prefix="throughput")],
+)
+trainer.train()
 ```
+
+Pass `sample_batch=` explicitly only if you want to control the calibration shape — for example, if your real training batches are very large and you'd rather profile on a single example, or if your dataset is an `IterableDataset` and you don't want one batch consumed for calibration.
+
+`throughput/mfu` and `throughput/mbu` are added to the Trainer log dict at each logging step and forwarded automatically to any configured integrations (WandB, TensorBoard, MLflow). WandB groups metrics by the `/` separator, so these appear in a distinct "throughput" section rather than alongside loss and learning rate.
 
 ### Optimizer wrapper
 
@@ -87,29 +88,25 @@ for batch in dataloader:
         print(f"MFU {result.mfu:.3f}  MBU {result.mbu:.3f}")
 ```
 
-### HuggingFace Trainer
+### Context manager (bare PyTorch)
 
 ```python
-from mfu_tracker.integrations.hf_trainer import MFUCallback
+from mfu_tracker import track, profile_flops, param_bytes
 
-sample_batch = {k: v[:batch_size] for k, v in next(iter(train_dataloader)).items()}
+# Profile once on the uncompiled model before training begins
+sample = {"input_ids": batch["input_ids"][:1]}
+flops = profile_flops(model, kwargs=sample, with_backward=True)
+p_bytes = param_bytes(model)
 
-callback = MFUCallback(
-    sample_batch=sample_batch,
-    dtype="bf16",
-    metric_prefix="throughput",  # logs throughput/mfu and throughput/mbu
-)
+for batch in dataloader:
+    optimizer.zero_grad()
+    with track(flops, p_bytes, dtype="bf16") as result:
+        loss = model(**batch).loss
+        loss.backward()
+    optimizer.step()
 
-trainer = Trainer(
-    model=model,
-    args=training_args,
-    train_dataset=train_dataset,
-    callbacks=[callback],
-)
-trainer.train()
+    print(f"MFU: {result.mfu:.3f}  MBU: {result.mbu:.3f}  {result.elapsed_sec*1000:.0f} ms/step")
 ```
-
-`throughput/mfu` and `throughput/mbu` are added to the Trainer log dict at each logging step and forwarded automatically to any configured integrations (WandB, TensorBoard, MLflow). WandB groups metrics by the `/` separator, so these appear in a distinct "throughput" section rather than alongside loss and learning rate.
 
 ---
 

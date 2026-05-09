@@ -76,6 +76,67 @@ def test_hfu_backward_factor_explicit_value_not_overridden():
     assert cb.hfu_backward_factor == 2.5
 
 
+def test_sample_batch_autograbbed_from_dataloader():
+    """When sample_batch=None, on_train_begin should pull one from train_dataloader."""
+    cb = MFUCallback(dtype="fp16")  # no sample_batch passed
+    assert cb.sample_batch is None
+    auto_batch = {"x": torch.randn(2, 8)}
+    train_dataloader = [auto_batch]  # iterable yielding one batch
+
+    model = _TinyMLP()
+    with patch.object(cb, "_profile") as mock_profile:
+        cb.on_train_begin(
+            MagicMock(gradient_checkpointing=False),
+            _dummy_state(),
+            _dummy_control(),
+            model=model,
+            train_dataloader=train_dataloader,
+        )
+
+    assert cb.sample_batch is auto_batch
+    mock_profile.assert_called_once_with(model)
+
+
+def test_sample_batch_explicit_not_overridden_by_autograb():
+    """User-supplied sample_batch survives even when train_dataloader is available."""
+    explicit = {"x": torch.randn(1, 8)}
+    cb = MFUCallback(sample_batch=explicit, dtype="fp16")
+    train_dataloader = [{"x": torch.randn(99, 8)}]
+
+    with patch.object(cb, "_profile"):
+        cb.on_train_begin(
+            MagicMock(gradient_checkpointing=False),
+            _dummy_state(),
+            _dummy_control(),
+            model=_TinyMLP(),
+            train_dataloader=train_dataloader,
+        )
+
+    assert cb.sample_batch is explicit
+
+
+def test_sample_batch_autograb_warns_on_non_dict():
+    """Non-dict batches (e.g. tuples/tensors) skip auto-grab with a warning."""
+    cb = MFUCallback(dtype="fp16")
+    train_dataloader = [(torch.randn(1, 8), torch.tensor([0]))]  # tuple, not dict
+
+    import warnings as _w
+    with _w.catch_warnings(record=True) as caught:
+        _w.simplefilter("always")
+        cb.on_train_begin(
+            MagicMock(gradient_checkpointing=False),
+            _dummy_state(),
+            _dummy_control(),
+            model=_TinyMLP(),
+            train_dataloader=train_dataloader,
+        )
+
+    assert cb.sample_batch is None
+    assert any("non-dict batch" in str(w.message) for w in caught)
+    # _profile must NOT be called since sample_batch stayed None
+    assert cb._fwd_flops is None
+
+
 def test_on_step_begin_skipped_when_not_profiled():
     """If profiling failed, on_step_begin should do nothing rather than crash."""
     cb = _make_callback()

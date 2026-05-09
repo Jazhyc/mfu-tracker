@@ -34,9 +34,9 @@ class MFUCallback(TrainerCallback):
 
         from mfu_tracker.integrations.hf_trainer import MFUCallback
 
-        callback = MFUCallback(sample_batch=next(iter(train_dataloader)), dtype="bf16")
-        # num_gpus is auto-detected from torch.distributed — no manual config needed
-        trainer = Trainer(..., callbacks=[callback])
+        # Zero-config: sample batch grabbed from train_dataloader, hfu_backward_factor
+        # auto-detected from args.gradient_checkpointing.
+        trainer = Trainer(..., callbacks=[MFUCallback(dtype="bf16")])
 
     **torch.compile**: profile_flops is called at ``on_train_begin``, before the
     first compiled step. This is correct — ``torch.compile`` does not change the
@@ -51,6 +51,11 @@ class MFUCallback(TrainerCallback):
     Args:
         sample_batch:    A representative batch dict passed as ``**kwargs`` to the
                          model. Used once at training start to profile forward FLOPs.
+                         Pass ``None`` (default) to grab the first batch from
+                         ``train_dataloader`` automatically at ``on_train_begin``.
+                         For ``IterableDataset``, the auto-grabbed batch is consumed
+                         and not seen by the training loop — pass an explicit batch
+                         if you need to keep every sample.
         dtype:           Compute dtype for the peak ceiling — "fp16", "bf16", etc.
         num_gpus:        GPUs in the peak ceiling (default 1).
         hfu_backward_factor: Backward + recomputation cost as a multiple of
@@ -70,7 +75,7 @@ class MFUCallback(TrainerCallback):
 
     def __init__(
         self,
-        sample_batch: dict[str, Any],
+        sample_batch: Optional[dict[str, Any]] = None,
         dtype: str = "bf16",
         num_gpus: int = 1,
         hfu_backward_factor: Optional[float] = None,
@@ -95,6 +100,7 @@ class MFUCallback(TrainerCallback):
         self._pending: list[tuple] = []
 
     def _profile(self, model: nn.Module) -> None:
+        assert self.sample_batch is not None  # caller ensures
         self._spec = get_gpu_spec(self.device)
         self._param_bytes = param_bytes(model)
         try:
@@ -120,7 +126,26 @@ class MFUCallback(TrainerCallback):
     def on_train_begin(self, args, state, control, model=None, **kwargs):
         if self.hfu_backward_factor is None:
             self.hfu_backward_factor = 3.0 if getattr(args, "gradient_checkpointing", False) else 2.0
-        if model is not None and torch.cuda.is_available():
+        if self.sample_batch is None:
+            train_dataloader = kwargs.get("train_dataloader")
+            if train_dataloader is not None:
+                try:
+                    batch = next(iter(train_dataloader))
+                    if isinstance(batch, dict):
+                        self.sample_batch = batch
+                    else:
+                        warnings.warn(
+                            "mfu-tracker: train_dataloader yielded a non-dict batch "
+                            f"({type(batch).__name__}); pass sample_batch= explicitly.",
+                            stacklevel=2,
+                        )
+                except Exception as exc:
+                    warnings.warn(
+                        f"mfu-tracker: could not auto-grab sample batch ({exc}); "
+                        "pass sample_batch= explicitly.",
+                        stacklevel=2,
+                    )
+        if model is not None and torch.cuda.is_available() and self.sample_batch is not None:
             self._model = model
             self._profile(model)
 
