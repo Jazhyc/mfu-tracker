@@ -133,6 +133,34 @@ def test_track_mfu_correct():
     assert result.achieved_tbs == pytest.approx(1.0)
 
 
+def test_track_populates_tokens_per_sec_when_num_tokens_supplied():
+    spec = _mock_spec(peak_tflops=100.0)
+    elapsed_s = 0.5  # 4096 tokens / 0.5s = 8192 tok/s
+
+    with (
+        patch("torch.cuda.synchronize"),
+        patch("mfu_tracker.tracker.time") as mock_time,
+    ):
+        mock_time.perf_counter.side_effect = [0.0, elapsed_s]
+        with track(int(1e12), int(1e9), num_tokens=4096, spec=spec) as result:
+            pass
+
+    assert result.tokens_per_sec == pytest.approx(8192.0)
+
+
+def test_track_tokens_per_sec_none_when_num_tokens_omitted():
+    spec = _mock_spec()
+    with (
+        patch("torch.cuda.synchronize"),
+        patch("mfu_tracker.tracker.time") as mock_time,
+    ):
+        mock_time.perf_counter.side_effect = [0.0, 1.0]
+        with track(int(1e12), int(1e9), spec=spec) as result:
+            pass
+
+    assert result.tokens_per_sec is None
+
+
 def test_track_result_none_during_block():
     """Fields must be None while the block is executing."""
     spec = _mock_spec()

@@ -113,7 +113,9 @@ class MFUOptimizerWrapper:
         self._param_bytes = param_bytes(self._model)
 
     @contextmanager
-    def track_step(self) -> Generator[UtilizationResult, None, None]:
+    def track_step(
+        self, num_tokens: Optional[int] = None
+    ) -> Generator[UtilizationResult, None, None]:
         """
         Context manager that wraps one training step and populates a
         :class:`~mfu_tracker.UtilizationResult` with MFU and MBU.
@@ -122,15 +124,17 @@ class MFUOptimizerWrapper:
         block. Call ``optimizer.step()`` **after** the block so it is excluded
         from the timing window::
 
-            with wrapped.track_step() as result:
+            with wrapped.track_step(num_tokens=batch_tokens) as result:
                 out = model(**batch)
                 out.loss.backward()
             wrapped.step()
+            print(result.tokens_per_sec)
 
         MFU FLOPs are fixed at ``fwd_flops × 3`` (algorithmic convention).
         HFU FLOPs are ``fwd_hfu_flops × (1 + hfu_backward_factor)``. Default
         ``2.0`` matches MFU (no recomputation); pass ``3.0`` for full
-        activation checkpointing.
+        activation checkpointing. Pass ``num_tokens`` (typically
+        ``batch × seq_len``) to populate ``result.tokens_per_sec``.
         """
         if self._spec is None:
             self._profile_once()
@@ -158,6 +162,7 @@ class MFUOptimizerWrapper:
                 if self._fwd_hfu_flops is not None else None
             )
             result._param_bytes = self._param_bytes
+            result._num_tokens = num_tokens
             result._device = self._device
 
     # --- Proxy the underlying optimizer ------------------------------------

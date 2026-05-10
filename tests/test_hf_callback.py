@@ -1,5 +1,6 @@
 """Tests for MFUCallback — no real GPU needed, CUDA calls mocked."""
 from unittest.mock import MagicMock, patch
+import pytest
 import torch
 import torch.nn as nn
 
@@ -276,6 +277,52 @@ def test_on_log_computes_mfu_mbu():
     assert isinstance(logs["throughput/mfu"], float)
     assert isinstance(logs["throughput/mbu"], float)
     assert cb._pending == []  # flushed
+
+
+def test_on_log_emits_tokens_per_sec_when_input_ids_in_sample():
+    """tokens_per_sec is computed from sample_batch['input_ids'].numel()."""
+    sample = {"input_ids": torch.randint(0, 100, (4, 512))}  # 2048 tokens/step
+    cb = MFUCallback(sample_batch=sample, dtype="fp16")
+    cb._fwd_flops = 1_000_000
+    cb._param_bytes = 50_000
+    cb._spec = MagicMock()
+    cb._spec.peak_tflops.return_value = 156.0
+    cb._spec.peak_memory_bandwidth_tbs = 2.0
+    cb._tokens_per_step = sample["input_ids"].numel()  # 2048
+
+    # Two steps × 2048 tokens / (2 × 70ms = 0.14s) = 29257 tok/s
+    e = MagicMock()
+    e.elapsed_time.return_value = 70.0
+    cb._pending = [(e, e), (e, e)]
+
+    logs = {}
+    with patch("torch.cuda.synchronize"):
+        cb.on_log(_dummy_args(), _dummy_state(), _dummy_control(), logs=logs)
+
+    assert "throughput/tokens_per_sec" in logs
+    assert logs["throughput/tokens_per_sec"] == pytest.approx(29257.1, rel=0.01)
+
+
+def test_on_log_skips_tokens_per_sec_when_no_input_ids():
+    """Non-LLM batches (no 'input_ids' key) → tokens_per_sec is omitted, no crash."""
+    cb = _make_callback()  # sample is {"x": ...}, not {"input_ids": ...}
+    cb._fwd_flops = 1_000_000
+    cb._param_bytes = 50_000
+    cb._spec = MagicMock()
+    cb._spec.peak_tflops.return_value = 156.0
+    cb._spec.peak_memory_bandwidth_tbs = 2.0
+    # _tokens_per_step stays None since input_ids was absent at profile time
+
+    e = MagicMock()
+    e.elapsed_time.return_value = 70.0
+    cb._pending = [(e, e)]
+
+    logs = {}
+    with patch("torch.cuda.synchronize"):
+        cb.on_log(_dummy_args(), _dummy_state(), _dummy_control(), logs=logs)
+
+    assert "throughput/mfu" in logs
+    assert "throughput/tokens_per_sec" not in logs
 
 
 def test_on_log_skips_when_no_pending():

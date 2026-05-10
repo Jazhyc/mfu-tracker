@@ -105,6 +105,11 @@ class MFUCallback(TrainerCallback):
         self._fwd_flops: Optional[int] = None
         self._fwd_hfu_flops: Optional[int] = None
         self._param_bytes: Optional[int] = None
+        # Tokens per step inferred from sample_batch["input_ids"] at profile
+        # time; assumes constant batch shape (the dominant LLM case). Variable-
+        # length packed batches can override by passing the active token count
+        # to a future API; for now we report nothing if input_ids is absent.
+        self._tokens_per_step: Optional[int] = None
 
         # Each entry: (e_start, e_bwd, e_end, bwd_recorded)
         # Each entry: (e_start, e_end). Accumulated between on_log calls.
@@ -114,6 +119,12 @@ class MFUCallback(TrainerCallback):
         assert self.sample_batch is not None  # caller ensures
         self._spec = get_gpu_spec(self.device)
         self._param_bytes = param_bytes(model)
+        # Token count per step from `input_ids` if present (the standard LLM
+        # convention). Skipped silently for non-LLM batches — tokens_per_sec
+        # just won't be logged.
+        ids = self.sample_batch.get("input_ids")
+        if isinstance(ids, torch.Tensor):
+            self._tokens_per_step = int(ids.numel())
         try:
             # Move sample batch to the model's device (Trainer may have moved the model).
             model_device = next(model.parameters()).device
@@ -241,3 +252,7 @@ class MFUCallback(TrainerCallback):
         logs[f"{prefix}mbu"] = round(
             compute_mbu(self._param_bytes * n_steps, elapsed_sec, num_gpus=self.num_gpus, spec=self._spec), 4
         )
+        if self._tokens_per_step is not None:
+            logs[f"{prefix}tokens_per_sec"] = round(
+                self._tokens_per_step * n_steps / elapsed_sec, 1
+            )

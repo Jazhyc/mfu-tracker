@@ -33,6 +33,7 @@ class UtilizationResult:
     _elapsed_sec: Optional[float] = field(default=None, repr=False)
     _achieved_tflops: Optional[float] = field(default=None, repr=False)
     _achieved_tbs: Optional[float] = field(default=None, repr=False)
+    _tokens_per_sec: Optional[float] = field(default=None, repr=False)
 
     # Set by MFUOptimizerWrapper for lazy resolution.
     _e_start: Any = field(default=None, repr=False)
@@ -40,6 +41,7 @@ class UtilizationResult:
     _total_flops: Optional[int] = field(default=None, repr=False)
     _total_hfu_flops: Optional[int] = field(default=None, repr=False)
     _param_bytes: Optional[int] = field(default=None, repr=False)
+    _num_tokens: Optional[int] = field(default=None, repr=False)
     _device: Optional[torch.device] = field(default=None, repr=False)
 
     def _resolve(self) -> None:
@@ -65,6 +67,8 @@ class UtilizationResult:
         if self._total_hfu_flops is not None:
             self._hfu = (self._total_hfu_flops / elapsed / 1e12) / peak_tflops
         self._mbu = achieved_tbs / peak_tbs
+        if self._num_tokens is not None:
+            self._tokens_per_sec = self._num_tokens / elapsed
         self._e_start = None  # mark resolved
 
     @property
@@ -122,6 +126,16 @@ class UtilizationResult:
     def achieved_tbs(self, v: Optional[float]) -> None:
         self._achieved_tbs = v
 
+    @property
+    def tokens_per_sec(self) -> Optional[float]:
+        """Throughput in tokens/sec — None unless ``num_tokens`` was supplied."""
+        self._resolve()
+        return self._tokens_per_sec
+
+    @tokens_per_sec.setter
+    def tokens_per_sec(self, v: Optional[float]) -> None:
+        self._tokens_per_sec = v
+
 
 @contextmanager
 def track(
@@ -129,6 +143,7 @@ def track(
     param_bytes: int,
     *,
     hfu_flop_count: Optional[int] = None,
+    num_tokens: Optional[int] = None,
     dtype: str = "fp16",
     num_gpus: int = 1,
     device: Optional[torch.device] = None,
@@ -144,6 +159,9 @@ def track(
                      (causal SDPA halved). When supplied, ``result.hfu`` is
                      populated alongside ``result.mfu``. Get this from
                      ``profile_flops_with_hfu(...).hfu_flops``.
+        num_tokens:  Optional token count for the block (e.g. ``batch × seq_len``
+                     or sum of active tokens for variable-length packed batches).
+                     When supplied, ``result.tokens_per_sec`` is populated.
         dtype:       Compute dtype string — "fp16", "bf16", "int8", "fp8", "int4", "fp4".
         num_gpus:    Multiplier applied to the peak ceiling (default 1). When using
                      ``profile_flops`` as the source of *flop_count*, leave this at 1
@@ -196,6 +214,8 @@ def track(
     if hfu_flop_count is not None:
         result.hfu = (hfu_flop_count / elapsed / 1e12) / peak_tflops
     result.mbu = result.achieved_tbs / peak_tbs
+    if num_tokens is not None:
+        result.tokens_per_sec = num_tokens / elapsed
 
 
 def compute_mfu(

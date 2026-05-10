@@ -60,7 +60,7 @@ trainer.train()
 
 Pass `sample_batch=` explicitly only if you want to control the calibration shape — for example, if your real training batches are very large and you'd rather profile on a single example, or if your dataset is an `IterableDataset` and you don't want one batch consumed for calibration.
 
-`throughput/mfu` and `throughput/mbu` are added to the Trainer log dict at each logging step and forwarded automatically to any configured integrations (WandB, TensorBoard, MLflow). WandB groups metrics by the `/` separator, so these appear in a distinct "throughput" section rather than alongside loss and learning rate.
+`throughput/mfu`, `throughput/mbu`, and `throughput/tokens_per_sec` (when the batch has an `input_ids` field) are added to the Trainer log dict at each logging step and forwarded automatically to any configured integrations (WandB, TensorBoard, MLflow). WandB groups metrics by the `/` separator, so these appear in a distinct "throughput" section rather than alongside loss and learning rate. `throughput/hfu` is also emitted when it would differ from MFU (causal SDPA or activation checkpointing).
 
 ### Optimizer wrapper
 

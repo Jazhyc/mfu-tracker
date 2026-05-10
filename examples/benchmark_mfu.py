@@ -112,7 +112,7 @@ def run(
     dtype_str: str,
     grad_ckpt: bool = False,
 ) -> tuple[float, float, float, float, float] | None:
-    """Returns (mean_mfu, mean_hfu, mean_mbu, mean_step_ms, peak_gb), or None on OOM."""
+    """Returns (mean_mfu, mean_hfu, mean_mbu, mean_tokens_per_sec, peak_gb), or None on OOM."""
     dtype = _DTYPE_MAP[dtype_str]
     try:
         model = load_model(model_id, attn_impl, dtype)
@@ -141,7 +141,8 @@ def run(
         if use_compile:
             model = torch.compile(model)
 
-        mfu_vals, hfu_vals, mbu_vals, ms_vals = [], [], [], []
+        tokens_per_step = batch_size * seq_len
+        mfu_vals, hfu_vals, mbu_vals, tok_s_vals = [], [], [], []
 
         for step in range(warmup + steps):
             batch = {
@@ -155,7 +156,12 @@ def run(
                 torch.cuda.reset_peak_memory_stats()
 
             optimizer.zero_grad()
-            with track(mfu_flops, p_bytes, hfu_flop_count=hfu_flops, dtype=dtype_str) as result:
+            with track(
+                mfu_flops, p_bytes,
+                hfu_flop_count=hfu_flops,
+                num_tokens=tokens_per_step,
+                dtype=dtype_str,
+            ) as result:
                 out = model(**batch)
                 out.loss.backward()
             optimizer.step()
@@ -164,14 +170,14 @@ def run(
                 mfu_vals.append(result.mfu)
                 hfu_vals.append(result.hfu)
                 mbu_vals.append(result.mbu)
-                ms_vals.append(result.elapsed_sec * 1000)
+                tok_s_vals.append(result.tokens_per_sec)
 
         peak_gb = torch.cuda.max_memory_allocated() / 1e9
         return (
             sum(mfu_vals) / len(mfu_vals),
             sum(hfu_vals) / len(hfu_vals),
             sum(mbu_vals) / len(mbu_vals),
-            sum(ms_vals) / len(ms_vals),
+            sum(tok_s_vals) / len(tok_s_vals),
             peak_gb,
         )
 
@@ -296,8 +302,7 @@ def main() -> None:
         if result is None:
             print(" OOM — skipped")
         else:
-            mfu, hfu, mbu, ms, peak_gb = result
-            tok_s = bs * args.seq_len / (ms / 1000)  # batch-normalized throughput
+            mfu, hfu, mbu, tok_s, peak_gb = result
             rows.append((label, mfu, hfu, mbu, tok_s, peak_gb))
             print(
                 f" done ({elapsed:.0f}s)  MFU={mfu:.1%}  HFU={hfu:.1%}  "
