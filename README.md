@@ -46,14 +46,14 @@ HuggingFace Trainer integration requires no extra install — if you are already
 ```python
 from mfu_tracker.integrations.hf_trainer import MFUCallback
 
-# Zero-config: the callback grabs a sample batch from train_dataloader at
-# on_train_begin, and auto-detects hfu_backward_factor from
-# TrainingArguments.gradient_checkpointing.
+# Zero-config: sample_batch is grabbed from train_dataloader at on_train_begin;
+# dtype is read from TrainingArguments.bf16 / args.fp16; hfu_backward_factor
+# is read from args.gradient_checkpointing.
 trainer = Trainer(
     model=model,
     args=training_args,
     train_dataset=train_dataset,
-    callbacks=[MFUCallback(dtype="bf16", metric_prefix="throughput")],
+    callbacks=[MFUCallback()],
 )
 trainer.train()
 ```

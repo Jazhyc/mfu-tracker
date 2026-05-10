@@ -39,9 +39,10 @@ class MFUCallback(TrainerCallback):
 
         from mfu_tracker.integrations.hf_trainer import MFUCallback
 
-        # Zero-config: sample batch grabbed from train_dataloader, hfu_backward_factor
+        # Fully zero-config: sample batch grabbed from train_dataloader,
+        # dtype auto-detected from args.bf16 / args.fp16, hfu_backward_factor
         # auto-detected from args.gradient_checkpointing.
-        trainer = Trainer(..., callbacks=[MFUCallback(dtype="bf16")])
+        trainer = Trainer(..., callbacks=[MFUCallback()])
 
     **torch.compile**: profile_flops is called at ``on_train_begin``, before the
     first compiled step. This is correct — ``torch.compile`` does not change the
@@ -62,6 +63,11 @@ class MFUCallback(TrainerCallback):
                          and not seen by the training loop — pass an explicit batch
                          if you need to keep every sample.
         dtype:           Compute dtype for the peak ceiling — "fp16", "bf16", etc.
+                         ``None`` (default) auto-detects from ``args.bf16`` /
+                         ``args.fp16``, falling back to ``"fp32"`` if neither
+                         is set. Pass explicitly for non-standard dtypes
+                         (``"int8"``, ``"fp8"``, etc.) where HF's training
+                         flags don't apply.
         num_gpus:        GPUs in the peak ceiling (default 1).
         hfu_backward_factor: Backward + recomputation cost as a multiple of
                          forward FLOPs. ``None`` (default) auto-detects from
@@ -81,7 +87,7 @@ class MFUCallback(TrainerCallback):
     def __init__(
         self,
         sample_batch: Optional[dict[str, Any]] = None,
-        dtype: str = "bf16",
+        dtype: Optional[str] = None,
         num_gpus: int = 1,
         hfu_backward_factor: Optional[float] = None,
         metric_prefix: str = "throughput",
@@ -129,6 +135,16 @@ class MFUCallback(TrainerCallback):
     # --- TrainerCallback protocol -------------------------------------------
 
     def on_train_begin(self, args, state, control, model=None, **kwargs):
+        if self.dtype is None:
+            # bf16 and fp16 are mutually exclusive in HF Trainer; fall back to
+            # fp32 if neither is set. Only handles training-time dtypes — for
+            # int8/fp8/int4/fp4, pass `dtype=` explicitly.
+            if getattr(args, "bf16", False):
+                self.dtype = "bf16"
+            elif getattr(args, "fp16", False):
+                self.dtype = "fp16"
+            else:
+                self.dtype = "fp32"
         if self.hfu_backward_factor is None:
             self.hfu_backward_factor = 3.0 if getattr(args, "gradient_checkpointing", False) else 2.0
         if self.sample_batch is None:
@@ -206,10 +222,12 @@ class MFUCallback(TrainerCallback):
         # on_train_begin never resolved it (e.g. direct on_log calls in tests).
         hfu_factor = self.hfu_backward_factor if self.hfu_backward_factor is not None else 2.0
         hfu_step_factor = n_steps * (1 + hfu_factor)
+        # Same defensive fallback for dtype.
+        dtype = self.dtype if self.dtype is not None else "fp32"
 
         prefix = f"{self.metric_prefix}/" if self.metric_prefix else ""
         logs[f"{prefix}mfu"] = round(
-            compute_mfu(total_flops, elapsed_sec, dtype=self.dtype, num_gpus=self.num_gpus, spec=self._spec), 4
+            compute_mfu(total_flops, elapsed_sec, dtype=dtype, num_gpus=self.num_gpus, spec=self._spec), 4
         )
         # Emit HFU when it is meaningfully different from MFU — either because the
         # model uses causal SDPA (fwd_hfu_flops < fwd_flops) or because gradient
@@ -218,7 +236,7 @@ class MFUCallback(TrainerCallback):
         if fwd_hfu is not None and (fwd_hfu != self._fwd_flops or hfu_factor != 2.0):
             total_hfu_flops = int(fwd_hfu * hfu_step_factor)
             logs[f"{prefix}hfu"] = round(
-                compute_mfu(total_hfu_flops, elapsed_sec, dtype=self.dtype, num_gpus=self.num_gpus, spec=self._spec), 4
+                compute_mfu(total_hfu_flops, elapsed_sec, dtype=dtype, num_gpus=self.num_gpus, spec=self._spec), 4
             )
         logs[f"{prefix}mbu"] = round(
             compute_mbu(self._param_bytes * n_steps, elapsed_sec, num_gpus=self.num_gpus, spec=self._spec), 4

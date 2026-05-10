@@ -91,15 +91,13 @@ def main() -> None:
 
     dataset = _SyntheticDataset(size=512)
 
-    # Zero-config: no sample_batch needed (auto-grabbed from train_dataloader),
-    # no hfu_backward_factor needed (auto-detected from gradient_checkpointing).
-    # The callback profiles forward FLOPs once at on_train_begin, then records
-    # CUDA events each step and logs throughput/mfu, throughput/hfu (when it
-    # differs), and throughput/mbu at every logging interval.
-    callback = MFUCallback(
-        dtype=args.dtype,
-        metric_prefix=args.metric_prefix,
-    )
+    # Fully zero-config: sample_batch auto-grabbed from train_dataloader, dtype
+    # auto-detected from args.bf16 / args.fp16, hfu_backward_factor auto-detected
+    # from args.gradient_checkpointing. The callback profiles forward FLOPs once
+    # at on_train_begin, then records CUDA events each step and logs
+    # throughput/mfu, throughput/hfu (when it differs), and throughput/mbu at
+    # every logging interval.
+    callback = MFUCallback(metric_prefix=args.metric_prefix)
 
     fp16 = args.dtype == "fp16"
     bf16 = args.dtype == "bf16"

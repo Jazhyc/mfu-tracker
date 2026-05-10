@@ -76,6 +76,43 @@ def test_hfu_backward_factor_explicit_value_not_overridden():
     assert cb.hfu_backward_factor == 2.5
 
 
+def test_dtype_autodetected_from_bf16_arg():
+    """args.bf16=True → dtype='bf16'."""
+    sample = {"x": torch.randn(1, 8)}
+    cb = MFUCallback(sample_batch=sample)  # no dtype passed
+    assert cb.dtype is None
+    args = MagicMock(bf16=True, fp16=False, gradient_checkpointing=False)
+    cb.on_train_begin(args, _dummy_state(), _dummy_control(), model=None)
+    assert cb.dtype == "bf16"
+
+
+def test_dtype_autodetected_from_fp16_arg():
+    """args.fp16=True (and bf16 false) → dtype='fp16'."""
+    sample = {"x": torch.randn(1, 8)}
+    cb = MFUCallback(sample_batch=sample)
+    args = MagicMock(bf16=False, fp16=True, gradient_checkpointing=False)
+    cb.on_train_begin(args, _dummy_state(), _dummy_control(), model=None)
+    assert cb.dtype == "fp16"
+
+
+def test_dtype_falls_back_to_fp32_when_no_flag_set():
+    """Neither bf16 nor fp16 set → dtype='fp32'."""
+    sample = {"x": torch.randn(1, 8)}
+    cb = MFUCallback(sample_batch=sample)
+    args = MagicMock(bf16=False, fp16=False, gradient_checkpointing=False)
+    cb.on_train_begin(args, _dummy_state(), _dummy_control(), model=None)
+    assert cb.dtype == "fp32"
+
+
+def test_dtype_explicit_value_not_overridden():
+    """User-supplied dtype survives auto-detection (e.g. for int8/fp8 inference)."""
+    sample = {"x": torch.randn(1, 8)}
+    cb = MFUCallback(sample_batch=sample, dtype="int8")
+    args = MagicMock(bf16=True, fp16=False, gradient_checkpointing=False)
+    cb.on_train_begin(args, _dummy_state(), _dummy_control(), model=None)
+    assert cb.dtype == "int8"
+
+
 def test_sample_batch_autograbbed_from_dataloader():
     """When sample_batch=None, on_train_begin should pull one from train_dataloader."""
     cb = MFUCallback(dtype="fp16")  # no sample_batch passed
