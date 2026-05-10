@@ -5,7 +5,7 @@ When profiling training runs, I found that most existing tools either lacked MFU
 **mfu-tracker** is a PyTorch library for measuring Model FLOPs Utilization (MFU) and Model Bandwidth Utilization (MBU). It supports bare PyTorch training loops, an optimizer wrapper, and a HuggingFace Trainer callback.
 
 - **Minimal dependencies** — PyTorch only.
-- **Profiled FLOPs, not formula estimates** — uses `FlopCounterMode` to count the FLOPs your model actually executes rather than a formula like `6 × params × tokens`. For Mixture-of-Experts models this means only active experts are counted, giving a more accurate numerator than parameter-based estimates.
+- **Profiled FLOPs, not formula estimates** — uses `FlopCounterMode` to count the FLOPs your model executes rather than an approximation like `6 × params × tokens`. For Mixture-of-Experts models this means only active experts are counted, giving a more accurate numerator than parameter-based estimates.
 - **Three integration styles** — context manager, optimizer wrapper, HF Trainer callback.
 - **WandB / TensorBoard / MLflow** — metrics are logged through HF Trainer's existing pipeline when using `MFUCallback`.
 
@@ -25,7 +25,7 @@ MBU = (param_bytes / elapsed_sec) / peak_memory_bandwidth
 
 where `param_bytes` is the total size of model parameters and `elapsed_sec` is wall time. This assumes one full pass through model weights per step and does not account for activation memory, gradients, optimizer state, or data layout effects. It is most useful as a relative indicator across runs rather than an absolute efficiency measure.
 
-If both MFU and MBU are low simultaneously, the GPU is underutilized. Two common causes: kernel dispatch overhead (the CPU cannot issue kernels fast enough to keep the GPU busy — `torch.compile` reduces this by fusing operations), or CPU-side pipeline stalls (slow DataLoader, heavy host preprocessing, or host-to-device transfers in the hot path).
+If both MFU and MBU are low simultaneously, the GPU is underutilized. Two common causes: kernel dispatch overhead (the CPU cannot issue kernels fast enough to keep the GPU busy — `torch.compile` reduces this by fusing operations), or CPU-side pipeline stalls (such as a slow DataLoader).
 
 ---
 
@@ -175,22 +175,32 @@ Supported dtypes: `fp32`, `fp16`, `bf16`, `int8`, `fp8`, `int4`, `fp4`. Unrecogn
 
 ---
 
-## Benchmark (RTX 4080, GPT-2 124M, fp16)
+## Benchmark (RTX 4080 16 GB, GPT-2 medium 355M, bf16, seq=512)
 
-| Configuration | MFU | ms/step |
-|---|---|---|
-| batch=1 · eager | ~0.027 | ~40 ms |
-| batch=8 · eager | ~0.09 | ~93 ms |
-| batch=8 · sdpa | ~0.12 | ~74 ms |
-| batch=8 · sdpa + compile | ~0.17 | ~50 ms |
-| batch=16 · sdpa + compile | ~0.16 | ~104 ms |
+| Configuration | MFU | HFU | MBU | tok/s | peak GB |
+|---|---|---|---|---|---|
+| batch=1 · eager | 4.4% | 4.4% | 1.5% | 7.3K | 3.68 |
+| batch=4 · eager | 10.6% | 10.6% | 0.9% | 18.1K | 7.22 |
+| batch=8 · eager | 10.6% | 10.6% | 0.4% | 18.1K | 13.72 |
+| batch=8 · sdpa | 13.9% | 13.4% | 0.6% | 23.8K | 12.52 |
+| batch=8 · sdpa + compile | 18.6% | 18.0% | 0.8% | 31.9K | 7.13 |
+| batch=8 · flash_attention_2 | 13.9% | 13.4% | 0.6% | 23.8K | 11.10 |
+| batch=8 · flash_attention_2 + compile | 20.0% | 19.3% | 0.8% | 34.3K | 7.17 |
+| batch=8 · sdpa + ckpt | 14.0% | 18.1% | 0.6% | 24.1K | 10.69 |
+| batch=8 · sdpa + compile + ckpt | 18.8% | 24.3% | 0.8% | 32.3K | 6.32 |
+| batch=16 · sdpa + compile + ckpt | 18.9% | 24.3% | 0.4% | 32.4K | 11.94 |
+| batch=16 · flash_attention_2 + compile + ckpt | 20.3% | 26.2% | 0.4% | 34.8K | 11.94 |
 
-GPT-2 (124M) is a small model relative to the compute capacity of a modern GPU, so low MFU is expected — the model spends a large fraction of step time waiting for kernel dispatch rather than doing arithmetic. Larger models (e.g. LLaMA-70B) typically reach 0.40–0.60 MFU. The improvement from `torch.compile` reflects kernel fusion reducing dispatch overhead. I'll add some testing on this later.
+Reproduce: `python examples/benchmark_mfu.py` (defaults to gpt2-medium / bf16 / seq=512 on a 16 GB card; flash_attention_2 rows appear automatically if the `flash_attn` package is installed).
 
-```bash
-python examples/benchmark_mfu.py --help
-python examples/hf_trainer_mfu.py --dtype bf16 --batch-size 16
-```
+**Key observations:**
+
+- **MFU caps at ~20% on this hardware.** GPT-2-medium isn't compute-heavy enough per kernel to saturate the 4080's tensor cores. 
+- **`torch.compile` is the single biggest lever** — +5pp MFU and ~40% memory reduction (12.5G → 7.1G). 
+- **`sdpa` and `flash_attention_2` are nearly identical without compile** (13.9% / 23.8K tok/s each) with the memory usage of `flash_attention_2` being slightly lower. 
+- **Activation checkpointing has near-zero wall-time cost on modern GPUs** at this model and hardware scale. HFU rises to ~`4/3 × MFU` (the Megatron convention) because the GPU genuinely does ~33% more hardware work; MFU and tok/s barely move.
+- **Bigger batch isn't buying throughput at this model size.** batch=16 at 32.4K tok/s vs batch=8 at 32.3K.Bigger batches matter for training dynamics (gradient noise, effective batch), not for raw efficiency on this hardware.
+- **MBU is consistently ≤1%** — the model is not memory-bandwidth-bound which is expected during offline training. The combination of "low MFU + low MBU" suggests a kernel-launch / non-matmul-overhead bottleneck. `nvidia-smi` would show near 100% utilization on every row above which is uninformative.
 
 ---
 
@@ -203,12 +213,11 @@ Leave `num_gpus=1` (the default) when using `profile_flops` as the FLOP source. 
 ## Limitations
 
 - **SDPA on CPU is not counted** — `FlopCounterMode` does not intercept flash attention dispatch on CPU. Profile with a CUDA model.
-- **MFU counts causal attention unmasked** — `profile_flops` and `compute_mfu` follow the PaLM/Chinchilla convention and report the raw matmul FLOPs for `F.scaled_dot_product_attention` regardless of `is_causal`. A causal flash-attention kernel actually executes ~half those FLOPs. The library reports HFU separately (see "MFU vs HFU" above) for the kernel-aware view. HFU detection only fires for `is_causal=True`; explicit causal masks via `attn_mask=`, sliding-window attention, and direct `flash_attn_func` calls are not auto-detected.
+- **MFU counts causal attention unmasked** — `profile_flops` and `compute_mfu` follow the PaLM convention and report the raw matmul FLOPs for `F.scaled_dot_product_attention` regardless of `is_causal`. A causal flash-attention kernel actually executes ~half those FLOPs. The library reports HFU separately (see "MFU vs HFU" above) for the kernel-aware view. HFU detection only fires for `is_causal=True`; explicit causal masks via `attn_mask=`, sliding-window attention, and direct `flash_attn_func` calls are not auto-detected.
 - **bitsandbytes quantized layers** — INT8/NF4 kernels are opaque to `FlopCounterMode`. NF4 dequantizes to fp16 before the matmul, so FLOP counts are approximately correct. Pass the appropriate dtype to use the right peak ceiling.
 - **`flash_attn_func` direct calls** — models bypassing `F.scaled_dot_product_attention` need a manual `flash_attn_flops()` correction (see above).
-- **Peak ceilings from spec sheets** — these are not independently measured. MFU > 1.0 indicates the ceiling is underestimated.
 - **MBU is a proxy** — the formula uses parameter bytes as a stand-in for memory traffic; actual DRAM traffic (activations, gradients, optimizer state) is higher and not measured.
-- I have not tested the library extensively yet; please open an issue if you encounter any bugs or unexpected behavior.
+- I have not tested the library extensively yet on larger GPUs or parallel configurations; please open an issue if you encounter unexpected behavior.
 
 ---
 
@@ -216,7 +225,7 @@ Leave `num_gpus=1` (the default) when using `profile_flops` as the FLOP source. 
 
 - Python 3.9+
 - PyTorch 2.1+ (for `FlopCounterMode`)
-- A CUDA GPU is required for meaningful results; CPU timing works but MFU will be near zero for any realistic model
+- An Nvidia GPU
 
 ---
 
