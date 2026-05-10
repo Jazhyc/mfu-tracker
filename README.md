@@ -173,6 +173,31 @@ print(spec.peak_memory_bandwidth_tbs)   # e.g. 0.717
 
 Supported dtypes: `fp32`, `fp16`, `bf16`, `int8`, `fp8`, `int4`, `fp4`. Unrecognized compute capabilities fall back to the nearest known major version with a `UserWarning`.
 
+### How the peak numbers are derived
+
+Rather than hard-coding the marketing TFLOPS value of every GPU model, the library derives peaks from first principles using only what `torch.cuda.get_device_properties()` reports plus a single tunable per architecture. The mental model:
+
+```
+fp16_peak_FLOPS = num_SMs × fp16_FLOPS_per_SM_per_clock × clock_rate_Hz
+peak_for(dtype) = fp16_peak_FLOPS × dtype_multiplier
+```
+
+`num_SMs` and `clock_rate` come straight from the driver. `dtype_multiplier` reflects how many smaller values fit into the same tensor-core slot — half the bits means twice the throughput. The only architecture-specific number is **`fp16_FLOPS_per_SM_per_clock`** — how many FP16 tensor-core ops one SM completes per cycle:
+
+| Architecture | (CC) | FP16 FLOPS/SM/clock |
+|---|---|---|
+| Volta | 7.0 | 1024 |
+| Turing | 7.5 | 1024 |
+| Ampere data-centre (A100) | 8.0 | 1024 |
+| Ampere consumer (RTX 30xx) | 8.6 | 512 |
+| Ada Lovelace (RTX 40xx) | 8.9 | 2048 |
+| Hopper (H100) | 9.0 | 3840 |
+| Blackwell (B100/B200) | 10.0 | 7680 |
+
+The full table lives in [src/mfu_tracker/gpu.py](src/mfu_tracker/gpu.py) under `_FP16_FLOPS_PER_SM_PER_CLOCK` and `_DTYPE_MULTIPLIER` — adding a new architecture is a single dict entry.
+
+Memory bandwidth is similarly derived: `memory_clock × bus_width × 2` (for DDR), again straight from device properties.
+
 ---
 
 ## Benchmark (RTX 4080 16 GB, GPT-2 medium 355M, bf16, seq=512)
